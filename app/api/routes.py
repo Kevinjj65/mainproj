@@ -1,7 +1,9 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response, stream_with_context
+import json
+import re
 from app.config import LANG_MAP, DEFAULT_TRANSLATOR_MODEL
 from app.services.cache_service import model_cache
-from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, unload_llm, current_name, SERVER_URL
+from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, current_name, SERVER_URL
 from app.services.translator_service import translate
 from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear
 
@@ -59,6 +61,9 @@ def ep_infer():
     english_text = translate(text, src_lang, "eng_Latn")
     print(f"Translated input to English: {english_text}")
 
+    # If client requests streaming (default True), stream sentence-by-sentence
+    stream = bool(body.get("stream", True))
+
     # 2. RAG retrieve
     rag_docs = rag_retrieve(english_text, top_k=3)
     context = ""
@@ -73,20 +78,60 @@ def ep_infer():
         "Answer clearly in simple English."
     )
 
-    # 4. Run inference
-    llm_output_en = llm_generate(final_prompt, max_new_tokens=max_tokens)
+    # 4/5. Run inference and (optionally) stream translations back
+    if not stream:
+        # Non-streaming (legacy) behaviour
+        llm_output_en = llm_generate(final_prompt, max_new_tokens=max_tokens)
+        answer_native = translate(llm_output_en, "eng_Latn", src_lang)
+        return jsonify({
+            "input": text,
+            "english_in": english_text,
+            "rag_used": rag_docs,
+            "llm_prompt": final_prompt,
+            "llm_output_en": llm_output_en,
+            "final_output": answer_native
+        })
 
-    # 5. Translate English answer back → original language
-    answer_native = translate(llm_output_en, "eng_Latn", src_lang)
+    # Streaming response (SSE). We will yield JSON payloads per translated sentence.
+    sentence_end_re = re.compile(r"(.+?[.!?](?:\"|'|”)?)(\s+|$)", re.S)
 
-    return jsonify({
-        "input": text,
-        "english_in": english_text,
-        "rag_used": rag_docs,
-        "llm_prompt": final_prompt,
-        "llm_output_en": llm_output_en,
-        "final_output": answer_native
-    })
+    def event_stream():
+        # Meta event with initial English input
+        meta = {"type": "meta", "english_in": english_text, "prompt": final_prompt}
+        yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+
+        buffer = ""
+        try:
+            for chunk in llm_generate_stream(final_prompt, max_new_tokens=max_tokens):
+                buffer += chunk
+                # extract complete sentences from buffer
+                while True:
+                    m = sentence_end_re.search(buffer)
+                    if not m:
+                        break
+                    sent = m.group(1).strip()
+                    buffer = buffer[m.end():]
+                    if not sent:
+                        continue
+                    # translate the sentence back to the user's language
+                    translated = translate(sent, "eng_Latn", src_lang)
+                    payload = {"type": "sentence", "english": sent, "translated": translated}
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            # flush remaining buffer
+            if buffer.strip():
+                sent = buffer.strip()
+                translated = translate(sent, "eng_Latn", src_lang)
+                payload = {"type": "sentence", "english": sent, "translated": translated}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            err = {"type": "error", "message": str(e)}
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+
+    headers = {"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return Response(stream_with_context(event_stream()), headers=headers)
 
 @bp.post("/infer_raw")
 def ep_infer_raw():

@@ -96,3 +96,45 @@ def llm_generate(prompt: str, max_new_tokens: int = 128) -> str:
     )
 
     return response["choices"][0]["text"]
+
+
+def llm_generate_stream(prompt: str, max_new_tokens: int = 128):
+    """
+    Stream generation from the current Llama instance.
+    Yields text chunks (strings) as they are produced by the model.
+    This is a best-effort wrapper that handles different stream chunk shapes
+    returned by `llama_cpp` across versions.
+    """
+    if current_llm is None:
+        raise RuntimeError("LLM not loaded")
+
+    # The llama_cpp client supports streaming; calling with stream=True
+    # returns an iterator of chunks (often dicts). We yield the text
+    # content from each chunk.
+    for chunk in current_llm(
+        prompt,
+        max_tokens=max_new_tokens,
+        stop=["</s>"],
+        echo=False,
+        stream=True,
+    ):
+        try:
+            # chunk may be a dict with choices -> text, or a simple string
+            if isinstance(chunk, dict):
+                choices = chunk.get("choices") or []
+                if choices:
+                    # Common shape: {'choices': [{'text': '...'}]}
+                    text = choices[0].get("text") or ""
+                else:
+                    # Fallback: try top-level text
+                    text = chunk.get("text", "")
+            elif isinstance(chunk, str):
+                text = chunk
+            else:
+                text = str(chunk)
+        except Exception:
+            # Ignore malformed chunks
+            continue
+
+        if text:
+            yield text

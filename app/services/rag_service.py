@@ -5,9 +5,22 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from app.config import RAG_INDEX_FILE, RAG_META_FILE
 
-# Load embedding model
-embed_model = SentenceTransformer("sentence-transformers/paraphrase-mpnet-base-v2")
-DIM = embed_model.get_sentence_embedding_dimension()
+# Lazy-load embedding model to avoid import errors at startup
+embed_model = None
+DIM = 768  # Default for paraphrase-mpnet-base-v2
+
+def get_embed_model():
+    """Lazy-load the embedding model on first use."""
+    global embed_model, DIM
+    if embed_model is None:
+        try:
+            embed_model = SentenceTransformer("sentence-transformers/paraphrase-mpnet-base-v2")
+            DIM = embed_model.get_sentence_embedding_dimension()
+        except Exception as e:
+            print(f"Warning: Failed to load embedding model: {e}")
+            print("RAG will not work until model is loaded manually.")
+            raise
+    return embed_model
 
 # Helper to normalize embeddings (unit length)
 def normalize(v):
@@ -32,7 +45,8 @@ def save_rag_state():
 
 def rag_add(text: str):
     doc_id = str(uuid.uuid4())
-    emb = embed_model.encode([text])
+    model = get_embed_model()
+    emb = model.encode([text])
     emb = normalize(emb)
     rag_index.add(emb)
     rag_meta[doc_id] = text
@@ -47,8 +61,9 @@ def rag_remove(doc_id: str):
 
     # Rebuild a fresh index
     new_index = faiss.IndexFlatIP(DIM)
+    model = get_embed_model()
     for t in rag_meta.values():
-        emb = embed_model.encode([t])
+        emb = model.encode([t])
         emb = normalize(emb)
         new_index.add(emb)
     
@@ -61,7 +76,8 @@ def rag_retrieve(query: str, top_k=3, similarity_threshold=0.35):
     if len(rag_meta) == 0:
         return []
     
-    q_emb = embed_model.encode([query])
+    model = get_embed_model()
+    q_emb = model.encode([query])
     q_emb = normalize(q_emb)
 
     sims, idxs = rag_index.search(q_emb, top_k)

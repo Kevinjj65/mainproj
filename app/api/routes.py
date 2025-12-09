@@ -1,11 +1,12 @@
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 import json
 import re
-from app.config import LANG_MAP, DEFAULT_TRANSLATOR_MODEL
+from app.config import LANG_MAP
 from app.services.cache_service import model_cache
 from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, current_name, SERVER_URL
 from app.services.translator_service import translate
 from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear
+from app.services.benchmark_service import benchmark_pipeline
 
 bp = Blueprint("api", __name__)
 
@@ -57,9 +58,19 @@ def ep_infer():
 
     src_lang, en_lang = LANG_MAP[lang]
     print(f"Translating from {src_lang} to {en_lang} and back.")
-    # 1. Convert user input → English
-    english_text = translate(text, src_lang, "eng_Latn")
-    print(f"Translated input to English: {english_text}")
+    
+    try:
+        # 1. Convert user input → English (using short codes)
+        english_text = translate(text, src_lang, "en")
+        print(f"Translated input to English: {english_text}")
+    except RuntimeError as e:
+        if "torchvision" in str(e) or "nms" in str(e):
+            return jsonify({
+                "error": "translator initialization failed due to dependency conflict",
+                "details": str(e),
+                "suggestion": "Try: pip install --upgrade transformers torch torchvision"
+            }), 503
+        raise
 
     # If client requests streaming (default True), stream sentence-by-sentence
     stream = bool(body.get("stream", True))
@@ -82,7 +93,7 @@ def ep_infer():
     if not stream:
         # Non-streaming (legacy) behaviour
         llm_output_en = llm_generate(final_prompt, max_new_tokens=max_tokens)
-        answer_native = translate(llm_output_en, "eng_Latn", src_lang)
+        answer_native = translate(llm_output_en, "en", src_lang)
         return jsonify({
             "input": text,
             "english_in": english_text,
@@ -114,14 +125,14 @@ def ep_infer():
                     if not sent:
                         continue
                     # translate the sentence back to the user's language
-                    translated = translate(sent, "eng_Latn", src_lang)
+                    translated = translate(sent, "en", src_lang)
                     payload = {"type": "sentence", "english": sent, "translated": translated}
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             # flush remaining buffer
             if buffer.strip():
                 sent = buffer.strip()
-                translated = translate(sent, "eng_Latn", src_lang)
+                translated = translate(sent, "en", src_lang)
                 payload = {"type": "sentence", "english": sent, "translated": translated}
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -202,3 +213,30 @@ def ep_unload_llm():
     """Stop the background llama-server."""
     unload_llm()
     return jsonify({"ok": True, "message": "LLM server stopped"})
+
+@bp.get("/benchmark")
+def ep_benchmark():
+    text = request.args.get("text", "കേരളത്തിൽ മഴ കനത്തിരിക്കുന്നു.")
+    lang = request.args.get("lang", "ml")
+
+    if lang not in LANG_MAP:
+        return jsonify({"error": f"Unsupported language {lang}"}), 400
+
+    src_lang, en_lang = LANG_MAP[lang]
+
+    try:
+        results = benchmark_pipeline(
+            test_text=text,
+            src_lang=src_lang,
+            tgt_lang=en_lang,
+            max_tokens=64,
+        )
+        return jsonify({"ok": True, "results": results})
+    except RuntimeError as e:
+        if "torchvision" in str(e) or "nms" in str(e):
+            return jsonify({
+                "error": "translator initialization failed due to dependency conflict",
+                "details": str(e),
+                "suggestion": "Try: pip install --upgrade transformers torch torchvision"
+            }), 503
+        raise

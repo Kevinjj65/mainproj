@@ -8,7 +8,8 @@ from app.config import (
     TRANS_DIR, 
     NLLB_MODEL, 
     NLLB_LANG_MAP, 
-    TRANSLATOR_QUANTIZE
+    TRANSLATOR_QUANTIZE,
+    CPU_ONLY
 )
 from app.services.cache_service import model_cache, save_cache
 
@@ -89,8 +90,8 @@ def get_translator(model_id: str):
         trust_remote_code=True
     )
 
-    # FORCE CUDA
-    use_cuda = torch.cuda.is_available()
+    # Device selection: respect CPU_ONLY flag
+    use_cuda = torch.cuda.is_available() and not CPU_ONLY
     device = "cuda:0" if use_cuda else "cpu"
 
     print(f"[NLLB] Loading model from {local_path} on {device} (quantize={TRANSLATOR_QUANTIZE})...")
@@ -214,7 +215,7 @@ def unload_translator(model_id: str = NLLB_MODEL):
         except Exception as e:
             print(f"[NLLB] Warning during unload: {e}")
         
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and not CPU_ONLY:
             torch.cuda.empty_cache()
         print(f"[NLLB] Unloaded translator: {model_id}")
         return True

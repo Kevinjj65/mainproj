@@ -8,7 +8,8 @@ from app.config import (
     LLM_DEFAULT_TOP_P,
     LLM_DEFAULT_TOP_K,
     LLM_DEFAULT_REPEAT_PENALTY,
-    LLM_DEFAULT_MAX_TOKENS
+    LLM_DEFAULT_MAX_TOKENS,
+    CPU_ONLY
 )
 from app.services.cache_service import model_cache, save_cache
 
@@ -60,6 +61,11 @@ def load_llm(model_name: str, n_ctx: int = None, n_gpu_layers: int = None):
         n_ctx = LLM_DEFAULT_N_CTX
     if n_gpu_layers is None:
         n_gpu_layers = LLM_DEFAULT_N_GPU_LAYERS
+    
+    # Force CPU-only if CPU_ONLY flag is set
+    if CPU_ONLY and n_gpu_layers != 0:
+        print(f"[LLM] CPU_ONLY mode enabled, forcing n_gpu_layers=0")
+        n_gpu_layers = 0
 
     gguf_path = local_gguf_path(model_name)
     if not gguf_path.exists():

@@ -5,7 +5,9 @@ import torch
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 
 # Device configuration
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+# Set CPU_ONLY=1 or CPU_ONLY=true in environment to force CPU inference (no GPU/VRAM usage)
+CPU_ONLY = os.environ.get("CPU_ONLY", "false").lower() in ("1", "true", "yes")
+DEVICE = "cpu" if CPU_ONLY else ("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # Directory paths
 BASE = Path("models")
@@ -83,7 +85,7 @@ RAG_TOP_K = 3
 
 # LLM configuration defaults
 LLM_DEFAULT_N_CTX = 4096
-LLM_DEFAULT_N_GPU_LAYERS = -1  # -1 = max GPU offload
+LLM_DEFAULT_N_GPU_LAYERS = 0 if CPU_ONLY else -1  # 0 = CPU only, -1 = max GPU offload
 LLM_DEFAULT_TEMPERATURE = 0.3
 LLM_DEFAULT_TOP_P = 0.9
 LLM_DEFAULT_TOP_K = 40

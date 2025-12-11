@@ -4,6 +4,7 @@ import json
 import gc
 import torch
 from sacrebleu.metrics import BLEU, CHRF
+from app.config import CPU_ONLY
 from app.services.translator_service import translate, unload_translator
 from app.services.llm_service import llm_generate, load_llm, unload_llm
 from app.services.rag_service import rag_add, rag_clear
@@ -23,11 +24,11 @@ def memory_snapshot():
     # CPU usage (percentage over 0.1s interval)
     cpu_percent = p.cpu_percent(interval=0.1)
     
-    # VRAM usage (CUDA)
+    # VRAM usage (CUDA) - only track if not in CPU_ONLY mode
     vram_used_mb = 0
     vram_total_mb = 0
     vram_free_mb = 0
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not CPU_ONLY:
         vram_free, vram_total = torch.cuda.mem_get_info()
         vram_used = vram_total - vram_free
         vram_used_mb = vram_used / (1024 * 1024)
@@ -183,7 +184,7 @@ def benchmark_resource_usage(
     unload_translator()
     rag_clear()
     gc.collect()
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not CPU_ONLY:
         torch.cuda.empty_cache()
     time.sleep(1)  # Let system stabilize
     

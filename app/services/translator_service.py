@@ -2,6 +2,8 @@ import sys
 import torch
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import BitsAndBytesConfig
+import os
 from app.config import DEVICE, TRANS_DIR
 from app.services.cache_service import model_cache, save_cache
 
@@ -10,7 +12,12 @@ sys.excepthook = lambda exc_type, exc, tb: (
     __import__('traceback').print_tb(tb)
 )
 
+
 translator_cache = {}
+
+# Quantization mode for translators: 'none', '8bit', or '4bit'.
+# Can be overridden via env var `TRANSLATOR_QUANTIZE`.
+TRANSLATOR_QUANTIZE = os.environ.get("TRANSLATOR_QUANTIZE", "8bit")
 
 # NLLB model: smaller, faster, multilingual
 NLLB_MODEL = "facebook/nllb-200-distilled-600M"
@@ -95,8 +102,9 @@ def get_translator(model_id: str):
     Keeps a single cached instance.
     """
 
-    if model_id in translator_cache:
-        return translator_cache[model_id]
+    cache_key = f"{model_id}__{TRANSLATOR_QUANTIZE}"
+    if cache_key in translator_cache:
+        return translator_cache[cache_key]
 
     local_path = download_translator(model_id)
 
@@ -110,27 +118,56 @@ def get_translator(model_id: str):
     use_cuda = torch.cuda.is_available()
     device = "cuda:0" if use_cuda else "cpu"
 
-    print(f"[NLLB] Loading model from {local_path} on {device}...")
+    print(f"[NLLB] Loading model from {local_path} on {device} (quantize={TRANSLATOR_QUANTIZE})...")
 
-    if use_cuda:
-        # Full model on GPU, FP16 to fit in 4GB VRAM
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            str(local_path),
-            trust_remote_code=True,
-            torch_dtype=torch.float16
-        )
-        model = model.to(device)
-    else:
-        # CPU fallback (slow)
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            str(local_path),
-            trust_remote_code=True,
-            torch_dtype=torch.float32
-        )
+    # Attempt quantized load when requested and CUDA is available
+    model = None
+    if use_cuda and TRANSLATOR_QUANTIZE in ("8bit", "4bit"):
+        try:
+            if TRANSLATOR_QUANTIZE == "8bit":
+                qconfig = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                )
+            else:
+                qconfig = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+
+            # Use device_map for automatic placement when quantized
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                str(local_path),
+                trust_remote_code=True,
+                quantization_config=qconfig,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+            )
+            print(f"[NLLB] Loaded quantized model ({TRANSLATOR_QUANTIZE}).")
+        except Exception as e:
+            print(f"[NLLB] Quantized load failed: {e}. Falling back to FP16/FP32 load.")
+
+    if model is None:
+        # Fallback: full model load (FP16 on CUDA, FP32 on CPU)
+        if use_cuda:
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                str(local_path),
+                trust_remote_code=True,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+            )
+            model = model.to(device)
+        else:
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                str(local_path),
+                trust_remote_code=True,
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True,
+            )
 
     model.eval()
 
-    translator_cache[model_id] = (tok, model, device)
+    translator_cache[cache_key] = (tok, model, device)
     print(f"[NLLB] Model ready on {device}.")
     return tok, model, device
 

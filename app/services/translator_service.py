@@ -1,15 +1,17 @@
 import sys
 import torch
 from pathlib import Path
+from langdetect import detect, DetectorFactory, LangDetectException
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from transformers import BitsAndBytesConfig
 from app.config import (
-    DEVICE, 
-    TRANS_DIR, 
-    NLLB_MODEL, 
-    NLLB_LANG_MAP, 
+    DEVICE,
+    TRANS_DIR,
+    NLLB_MODEL,
+    NLLB_LANG_MAP,
     TRANSLATOR_QUANTIZE,
-    CPU_ONLY
+    CPU_ONLY,
+    LANG_ALIASES,
 )
 from app.services.cache_service import model_cache, save_cache
 
@@ -19,6 +21,30 @@ sys.excepthook = lambda exc_type, exc, tb: (
 )
 
 translator_cache = {}
+
+
+def detect_supported_language(text: str):
+    """
+    Detect a supported language code from free-form text.
+
+    Returns:
+        The canonical LANG_CONF key (e.g., "hi") when detected and supported;
+        otherwise None.
+    """
+    if not text or not text.strip():
+        return None
+
+    try:
+        detected = detect(text)
+    except LangDetectException:
+        return None
+
+    # langdetect may return variants like "zh-cn"; we only care about the prefix
+    short = detected.split("-")[0].lower()
+    return LANG_ALIASES.get(short)
+
+# Fix seed for deterministic language detection
+DetectorFactory.seed = 42
 
 
 def local_translator_path(model_id: str) -> Path:

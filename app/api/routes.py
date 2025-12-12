@@ -1,10 +1,10 @@
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 import json
 import re
-from app.config import LANG_MAP
+from app.config import LANG_MAP, LANG_ALIASES
 from app.services.cache_service import model_cache
 from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, current_name, SERVER_URL
-from app.services.translator_service import translate
+from app.services.translator_service import translate, detect_supported_language
 from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear
 from app.services.benchmark_service import benchmark_pipeline, benchmark_resource_usage
 
@@ -61,6 +61,17 @@ def ep_infer():
 
     if not text:
         return jsonify({"error": "text required"}), 400
+
+    # Normalize language input and optionally auto-detect
+    lang = (lang or "").lower()
+    detected_lang = None
+    if lang == "auto":
+        detected_lang = detect_supported_language(text)
+        if not detected_lang:
+            return jsonify({"error": "could not auto-detect a supported language"}), 400
+        lang = detected_lang
+    else:
+        lang = LANG_ALIASES.get(lang, lang)
 
     if not lang or lang not in LANG_MAP:
         return jsonify({"error": f"unsupported lang: {lang}"}), 400
@@ -120,7 +131,9 @@ def ep_infer():
             "rag_used": rag_docs,
             "llm_prompt": final_prompt,
             "llm_output_en": llm_output_en,
-            "final_output": answer_native
+            "final_output": answer_native,
+            "lang_used": lang,
+            "detected_lang": detected_lang,
         })
 
     # Streaming response (SSE). We will yield JSON payloads per translated sentence.
@@ -128,7 +141,7 @@ def ep_infer():
 
     def event_stream():
         # Meta event with initial English input
-        meta = {"type": "meta", "english_in": english_text, "prompt": final_prompt}
+        meta = {"type": "meta", "english_in": english_text, "prompt": final_prompt, "lang_used": lang, "detected_lang": detected_lang}
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
         buffer = ""
@@ -243,6 +256,8 @@ def ep_unload_llm():
 def ep_benchmark():
     text = request.args.get("text", "കേരളത്തിൽ മഴ കനത്തിരിക്കുന്നു.")
     lang = request.args.get("lang", "ml")
+
+    lang = LANG_ALIASES.get(lang, lang)
 
     if lang not in LANG_MAP:
         return jsonify({"error": f"Unsupported language {lang}"}), 400

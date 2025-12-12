@@ -48,34 +48,42 @@ NLLB_LANG_MAP = {
     "ru": "rus_Cyrl",      # Russian
 }
 
-# Legacy LANG_MAP for /infer endpoint (IndicTrans2 format: source, target pairs)
-# Note: This is currently unused in favor of NLLB_LANG_MAP
-LANG_MAP = {
+# Language configuration used by /infer. LANG_CONF is the single source of truth; LANG_MAP and
+# LANG_ALIASES are derived for backwards compatibility and convenience.
+LANG_CONF = {
     # Indo-Aryan
-    "hi": ("hin_Deva", "eng_Latn"),      # Hindi
-    "bn": ("ben_Beng", "eng_Latn"),      # Bengali
-    "mr": ("mar_Deva", "eng_Latn"),      # Marathi
-    "gu": ("guj_Gujr", "eng_Latn"),      # Gujarati
-    "pa": ("pan_Guru", "eng_Latn"),      # Punjabi
-    "ur": ("urd_Arab", "eng_Latn"),      # Urdu
-    "as": ("asm_Beng", "eng_Latn"),      # Assamese
-    "bho": ("bho_Deva", "eng_Latn"),     # Bhojpuri
-    "mag": ("mag_Deva", "eng_Latn"),     # Magahi
-    "mai": ("mai_Deva", "eng_Latn"),     # Maithili
-    "hne": ("hne_Deva", "eng_Latn"),     # Chhattisgarhi
-    "or": ("ory_Orya", "eng_Latn"),      # Odia
-    "ks_ar": ("kas_Arab", "eng_Latn"),   # Kashmiri (Arabic)
-    "ks_de": ("kas_Deva", "eng_Latn"),   # Kashmiri (Devanagari)
-    "sd": ("snd_Arab", "eng_Latn"),      # Sindhi
-    "sa": ("san_Deva", "eng_Latn"),      # Sanskrit
-    "sat": ("sat_Olck", "eng_Latn"),     # Santali
-    "mni": ("mni_Beng", "eng_Latn"),     # Manipuri
+    "hi": {"src": "hin_Deva", "tgt": "eng_Latn", "aliases": ["hin"]},
+    "bn": {"src": "ben_Beng", "tgt": "eng_Latn", "aliases": ["ben"]},
+    "mr": {"src": "mar_Deva", "tgt": "eng_Latn", "aliases": ["mar"]},
+    "gu": {"src": "guj_Gujr", "tgt": "eng_Latn", "aliases": ["guj"]},
+    "pa": {"src": "pan_Guru", "tgt": "eng_Latn", "aliases": ["pan"]},
+    "ur": {"src": "urd_Arab", "tgt": "eng_Latn", "aliases": ["urd"]},
+    "as": {"src": "asm_Beng", "tgt": "eng_Latn", "aliases": ["asm"]},
+    "bho": {"src": "bho_Deva", "tgt": "eng_Latn", "aliases": []},
+    "mag": {"src": "mag_Deva", "tgt": "eng_Latn", "aliases": []},
+    "mai": {"src": "mai_Deva", "tgt": "eng_Latn", "aliases": []},
+    "hne": {"src": "hne_Deva", "tgt": "eng_Latn", "aliases": []},
+    "or": {"src": "ory_Orya", "tgt": "eng_Latn", "aliases": ["ory"]},
+    "ks_ar": {"src": "kas_Arab", "tgt": "eng_Latn", "aliases": []},
+    "ks_de": {"src": "kas_Deva", "tgt": "eng_Latn", "aliases": []},
+    "sd": {"src": "snd_Arab", "tgt": "eng_Latn", "aliases": ["snd"]},
+    "sa": {"src": "san_Deva", "tgt": "eng_Latn", "aliases": []},
+    "sat": {"src": "sat_Olck", "tgt": "eng_Latn", "aliases": []},
+    "mni": {"src": "mni_Beng", "tgt": "eng_Latn", "aliases": []},
     # Dravidian
-    "ta": ("tam_Taml", "eng_Latn"),      # Tamil
-    "te": ("tel_Telu", "eng_Latn"),      # Telugu
-    "kn": ("kan_Knda", "eng_Latn"),      # Kannada
-    "ml": ("mal_Mlym", "eng_Latn"),      # Malayalam
+    "ta": {"src": "tam_Taml", "tgt": "eng_Latn", "aliases": ["tam"]},
+    "te": {"src": "tel_Telu", "tgt": "eng_Latn", "aliases": ["tel"]},
+    "kn": {"src": "kan_Knda", "tgt": "eng_Latn", "aliases": ["kan"]},
+    "ml": {"src": "mal_Mlym", "tgt": "eng_Latn", "aliases": ["mal"]},
 }
+
+LANG_ALIASES = {}
+for key, conf in LANG_CONF.items():
+    for alias in {key, *conf.get("aliases", [])}:
+        LANG_ALIASES[alias] = key
+
+# Legacy tuple map retained for existing call sites
+LANG_MAP = {key: (conf["src"], conf["tgt"]) for key, conf in LANG_CONF.items()}
 
 # RAG configuration
 RAG_EMBEDDING_MODEL = "sentence-transformers/paraphrase-mpnet-base-v2"

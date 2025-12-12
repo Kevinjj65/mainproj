@@ -1,0 +1,20 @@
+meta {
+  name: Translate
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{dev}}/translate
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {"text":"ഇന്ത്യയുടെ രാഷ്ട്രപതി ആരാണ്?"}
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

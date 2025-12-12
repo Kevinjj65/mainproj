@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 import json
 import re
-from app.config import LANG_MAP, LANG_ALIASES
+from app.config import LANG_MAP, LANG_ALIASES, NLLB_LANG_MAP
 from app.services.cache_service import model_cache
 from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, current_name, SERVER_URL
 from app.services.translator_service import translate, detect_supported_language
@@ -51,6 +51,95 @@ def ep_load_llm():
     # load_llm_from_gguf accepts n_ctx and n_gpu_layers, not port or ctx_size
     load_llm_from_gguf(name, n_ctx=ctx_size, n_gpu_layers=n_gpu_layers)
     return jsonify({"ok": True, "loaded": name, "server_url": SERVER_URL})
+
+
+@bp.post("/translate")
+def ep_translate():
+    body = request.get_json() or {}
+    text = body.get("text")
+    target = (body.get("target") or "en").lower()
+    stream = bool(body.get("stream", True))
+    max_tokens = int(body.get("max_new_tokens", 256))
+
+    if not text:
+        return jsonify({"error": "text required"}), 400
+
+    # Auto-detect source language (must be in LANG_CONF)
+    src_lang_key = detect_supported_language(text)
+    if not src_lang_key:
+        return jsonify({"error": "could not auto-detect a supported language"}), 400
+
+    src_code, _ = LANG_MAP[src_lang_key]
+
+    # Normalize target and validate it against known mappings or raw NLLB codes
+    target_key = LANG_ALIASES.get(target, target)
+    target_code = NLLB_LANG_MAP.get(target_key, target_key)
+    if target_key not in LANG_MAP and target_key not in NLLB_LANG_MAP and "_" not in target_key:
+        return jsonify({"error": f"unsupported target language: {target}"}), 400
+
+    # Helper to iterate sentences from paragraphs
+    sentence_end_re = re.compile(r"(.+?[.!?](?:\"|'|”)?)(\s+|$)", re.S)
+
+    def iter_sentences(blob: str):
+        buffer = blob
+        while True:
+            match = sentence_end_re.search(buffer)
+            if not match:
+                break
+            sent = match.group(1).strip()
+            buffer = buffer[match.end():]
+            if sent:
+                yield sent
+        if buffer.strip():
+            yield buffer.strip()
+
+    if not stream:
+        translated_sentences = []
+        for sent in iter_sentences(text):
+            translated_sentences.append({
+                "source": sent,
+                "translated": translate(sent, src_code, target_code, max_tokens),
+            })
+
+        combined = " ".join(item["translated"] for item in translated_sentences)
+        return jsonify({
+            "input": text,
+            "detected_lang": src_lang_key,
+            "target_lang": target_key,
+            "translated_text": combined,
+            "sentences": translated_sentences,
+        })
+
+    def event_stream():
+        meta = {
+            "type": "meta",
+            "detected_lang": src_lang_key,
+            "target_lang": target_key,
+        }
+        yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+
+        try:
+            for idx, sent in enumerate(iter_sentences(text), start=1):
+                translated = translate(sent, src_code, target_code, max_tokens)
+                payload = {
+                    "type": "sentence",
+                    "index": idx,
+                    "source": sent,
+                    "translated": translated,
+                }
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            err = {"type": "error", "message": str(e)}
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+
+    headers = {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    }
+    return Response(stream_with_context(event_stream()), headers=headers)
 
 @bp.post("/infer")
 def ep_infer():

@@ -2,11 +2,12 @@ import time
 import psutil
 import json
 import gc
+import re
 import torch
 from sacrebleu.metrics import BLEU, CHRF
 from app.config import CPU_ONLY
 from app.services.translator_service import translate, unload_translator
-from app.services.llm_service import llm_generate, load_llm, unload_llm
+from app.services.llm_service import llm_generate, llm_generate_stream, load_llm, unload_llm
 from app.services.rag_service import rag_add, rag_clear
 
 def measure_time(fn, *args, **kwargs):
@@ -299,17 +300,71 @@ def benchmark_resource_usage(
             t_translate_in = time.perf_counter() - t_translate_in_start
             after_translate_in = memory_snapshot()
             
-            # Step 2: LLM inference in English
+            # Step 2: LLM inference with streaming + batched translation
+            # As LLM generates sentences, translate them incrementally
             t_infer_start = time.perf_counter()
-            llm_output_en = llm_generate(english_text, max_new_tokens=max_tokens)
+            
+            llm_output_en = ""
+            translated_sentences = []
+            sentence_buffer = ""
+            sentence_end_re = re.compile(r'(.+?[.!?](?:\"|\'|")?)?(\s+|$)', re.S)
+            
+            translation_batches = []
+            
+            for chunk in llm_generate_stream(english_text, max_new_tokens=max_tokens):
+                if chunk is None or not chunk:
+                    continue
+                    
+                sentence_buffer += chunk
+                llm_output_en += chunk
+                
+                # Extract complete sentences from buffer
+                while True:
+                    m = sentence_end_re.search(sentence_buffer)
+                    if not m:
+                        break
+                    
+                    sentence = m.group(1)
+                    if sentence:
+                        sentence = sentence.strip()
+                    sentence_buffer = sentence_buffer[m.end():]
+                    
+                    if not sentence:
+                        continue
+                    
+                    # Translate sentence immediately (batched processing)
+                    t_batch_start = time.perf_counter()
+                    translated_sentence = translate(sentence, "en", lang, max_tokens=256)
+                    t_batch = time.perf_counter() - t_batch_start
+                    
+                    translated_sentences.append(translated_sentence)
+                    translation_batches.append({
+                        "english_sentence": sentence,
+                        "translated_sentence": translated_sentence,
+                        "translation_time_s": t_batch
+                    })
+            
+            # Translate any remaining buffer content
+            if sentence_buffer and sentence_buffer.strip():
+                t_batch_start = time.perf_counter()
+                translated_sentence = translate(sentence_buffer.strip(), "en", lang, max_tokens=256)
+                t_batch = time.perf_counter() - t_batch_start
+                
+                translated_sentences.append(translated_sentence)
+                translation_batches.append({
+                    "english_sentence": sentence_buffer.strip(),
+                    "translated_sentence": translated_sentence,
+                    "translation_time_s": t_batch
+                })
+            
             t_infer = time.perf_counter() - t_infer_start
             after_infer = memory_snapshot()
             
-            # Step 3: Translate back to source language
-            t_translate_out_start = time.perf_counter()
-            final_output = translate(llm_output_en, "en", lang, max_tokens=256)
-            t_translate_out = time.perf_counter() - t_translate_out_start
-            after_translate_out = memory_snapshot()
+            # Combine all translated sentences
+            final_output = " ".join(translated_sentences) if translated_sentences else ""
+            
+            # Total translation time from batches
+            t_translate_out = sum(b["translation_time_s"] for b in translation_batches) if translation_batches else 0
             
             t_total = time.perf_counter() - t_start
             
@@ -320,25 +375,28 @@ def benchmark_resource_usage(
                 "english_text": english_text,
                 "llm_output_en": llm_output_en,
                 "final_output": final_output,
+                "num_translation_batches": len(translation_batches),
+                "translation_batches": translation_batches,
                 "timing": {
                     "translate_to_en_s": t_translate_in,
-                    "llm_inference_s": t_infer,
-                    "translate_to_source_s": t_translate_out,
+                    "llm_inference_total_s": t_infer,
+                    "translate_to_source_total_s": t_translate_out,
+                    "translate_to_source_avg_batch_s": t_translate_out / len(translation_batches) if translation_batches else 0,
                     "total_s": t_total
                 },
                 "metrics_before": before_run,
                 "metrics_after_translate_in": after_translate_in,
                 "metrics_after_infer": after_infer,
-                "metrics_after_translate_out": after_translate_out,
                 "delta": {
-                    "rss_mb": after_translate_out["rss_mb"] - before_run["rss_mb"],
-                    "vram_mb": after_translate_out["vram_used_mb"] - before_run["vram_used_mb"],
-                    "cpu_percent": after_translate_out["cpu_percent"],
+                    "rss_mb": after_infer["rss_mb"] - before_run["rss_mb"],
+                    "vram_mb": after_infer["vram_used_mb"] - before_run["vram_used_mb"],
+                    "cpu_percent": after_infer["cpu_percent"],
                 }
             }
             results["inference_runs"].append(run_result)
-            print(f"[BENCHMARK]   Total: {t_total:.2f}s (translate_in: {t_translate_in:.2f}s, infer: {t_infer:.2f}s, translate_out: {t_translate_out:.2f}s)")
-            print(f"[BENCHMARK]   CPU: {after_translate_out['cpu_percent']:.1f}%, RAM: {after_translate_out['rss_mb']:.1f}MB, VRAM: {after_translate_out['vram_used_mb']:.1f}MB")
+            print(f"[BENCHMARK]   Total: {t_total:.2f}s (translate_in: {t_translate_in:.2f}s, infer+translate: {t_infer:.2f}s)")
+            print(f"[BENCHMARK]   Batched {len(translation_batches)} sentences, avg translation: {t_translate_out / len(translation_batches) if translation_batches else 0:.2f}s/sentence")
+            print(f"[BENCHMARK]   CPU: {after_infer['cpu_percent']:.1f}%, RAM: {after_infer['rss_mb']:.1f}MB, VRAM: {after_infer['vram_used_mb']:.1f}MB")
             
         except Exception as e:
             run_result = {
@@ -356,13 +414,16 @@ def benchmark_resource_usage(
     if successful_runs:
         times = [r["timing"]["total_s"] for r in successful_runs]
         translate_in_times = [r["timing"]["translate_to_en_s"] for r in successful_runs]
-        infer_times = [r["timing"]["llm_inference_s"] for r in successful_runs]
-        translate_out_times = [r["timing"]["translate_to_source_s"] for r in successful_runs]
+        infer_times = [r["timing"]["llm_inference_total_s"] for r in successful_runs]
+        translate_out_times = [r["timing"]["translate_to_source_total_s"] for r in successful_runs]
+        total_batches = sum(r["num_translation_batches"] for r in successful_runs)
         
         results["summary"] = {
             "total_prompts": len(prompts),
             "successful_runs": len(successful_runs),
             "failed_runs": len(prompts) - len(successful_runs),
+            "total_translation_batches": total_batches,
+            "avg_batches_per_prompt": total_batches / len(successful_runs),
             "avg_total_time_s": sum(times) / len(times),
             "avg_translate_to_en_s": sum(translate_in_times) / len(translate_in_times),
             "avg_llm_inference_s": sum(infer_times) / len(infer_times),

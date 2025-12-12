@@ -3,7 +3,7 @@ import json
 import re
 from app.config import LANG_MAP, LANG_ALIASES, NLLB_LANG_MAP
 from app.services.cache_service import model_cache
-from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, current_name, SERVER_URL
+from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, get_current_name, SERVER_URL
 from app.services.translator_service import translate, detect_supported_language
 from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear
 from app.services.benchmark_service import benchmark_pipeline, benchmark_resource_usage
@@ -35,7 +35,7 @@ def ep_download_llm():
 def ep_list_llms():
     return jsonify({
         "downloaded_llms": model_cache["llms"],
-        "loaded_llm": current_name,
+        "loaded_llm": get_current_name(),
         "server_url": SERVER_URL,
     })
 
@@ -52,6 +52,14 @@ def ep_load_llm():
     load_llm_from_gguf(name, n_ctx=ctx_size, n_gpu_layers=n_gpu_layers)
     return jsonify({"ok": True, "loaded": name, "server_url": SERVER_URL})
 
+@bp.get("/current_llm")
+def ep_current_llm():
+    """Get the currently loaded LLM name."""
+    return jsonify({
+        "ok": True,
+        "loaded_llm": get_current_name(),
+        "server_url": SERVER_URL
+    })
 
 @bp.post("/translate")
 def ep_translate():

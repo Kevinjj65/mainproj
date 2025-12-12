@@ -96,6 +96,11 @@ load_llm_from_gguf = load_llm
 SERVER_URL = "http://localhost:8080"
 
 
+def get_current_name():
+    """Get the currently loaded LLM name."""
+    return current_name
+
+
 def unload_llm():
     global current_llm, current_name, current_path
     current_llm = None

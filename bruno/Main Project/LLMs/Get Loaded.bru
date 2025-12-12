@@ -1,0 +1,15 @@
+meta {
+  name: Get Loaded
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{dev}}/current_llm
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

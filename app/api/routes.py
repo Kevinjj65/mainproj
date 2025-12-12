@@ -1,6 +1,9 @@
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 import json
 import re
+import time
+import os
+import psutil
 from app.config import LANG_MAP, LANG_ALIASES, NLLB_LANG_MAP
 from app.services.cache_service import model_cache
 from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, get_current_name, SERVER_URL
@@ -138,6 +141,96 @@ def ep_translate():
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            err = {"type": "error", "message": str(e)}
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+
+    headers = {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    }
+    return Response(stream_with_context(event_stream()), headers=headers)
+
+
+@bp.get("/system/metrics")
+def ep_system_metrics():
+    """
+    Stream system metrics via SSE: CPU%, RAM (system + current process), and VRAM if available.
+
+    Query params:
+      - interval_ms: polling interval in milliseconds (default 1000)
+      - include_process: whether to include current python process stats (default true)
+    """
+    try:
+        interval_ms = int(request.args.get("interval_ms", "1000"))
+    except ValueError:
+        interval_ms = 1000
+    include_process = (request.args.get("include_process", "true").lower() in ("true", "1", "yes"))
+
+    process = psutil.Process(os.getpid()) if include_process else None
+
+    # Prime psutil CPU percent to compute over interval
+    psutil.cpu_percent(interval=None)
+
+    def get_vram():
+        try:
+            import torch
+            if torch.cuda.is_available():
+                total = torch.cuda.get_device_properties(0).total_memory
+                used = torch.cuda.memory_allocated(0)
+                reserved = torch.cuda.memory_reserved(0)
+                return {
+                    "available": True,
+                    "total_bytes": int(total),
+                    "used_bytes": int(used),
+                    "reserved_bytes": int(reserved),
+                }
+        except Exception as e:
+            return {"available": False, "error": str(e)}
+        return {"available": False}
+
+    def event_stream():
+        try:
+            while True:
+                cpu_pct = psutil.cpu_percent(interval=None)
+                vm = psutil.virtual_memory()
+                swap = psutil.swap_memory()
+
+                payload = {
+                    "type": "metrics",
+                    "timestamp": time.time(),
+                    "cpu_percent": cpu_pct,
+                    "ram": {
+                        "total_bytes": int(vm.total),
+                        "used_bytes": int(vm.used),
+                        "available_bytes": int(vm.available),
+                        "percent": float(vm.percent),
+                    },
+                    "swap": {
+                        "total_bytes": int(swap.total),
+                        "used_bytes": int(swap.used),
+                        "percent": float(swap.percent),
+                    },
+                    "vram": get_vram(),
+                }
+
+                if process is not None:
+                    with process.oneshot():
+                        mem_info = process.memory_info()
+                        cpu_proc = process.cpu_percent(interval=None)
+                        payload["process"] = {
+                            "pid": process.pid,
+                            "cpu_percent": cpu_proc,
+                            "rss_bytes": int(mem_info.rss),  # resident set size
+                            "vms_bytes": int(mem_info.vms),  # virtual memory size
+                        }
+
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                time.sleep(max(0.05, interval_ms / 1000.0))
+        except GeneratorExit:
+            # Client disconnected; stop the stream
+            return
         except Exception as e:
             err = {"type": "error", "message": str(e)}
             yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"

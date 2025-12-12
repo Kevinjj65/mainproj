@@ -1,0 +1,16 @@
+meta {
+  name: Unload LLM
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{dev}}/unload_llm
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

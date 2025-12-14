@@ -7,10 +7,10 @@ import os
 import torch
 from pathlib import Path
 from sacrebleu.metrics import BLEU, CHRF
-from app.config import CPU_ONLY, LLM_DIR
+from app.config import CPU_ONLY, LLM_DIR, RAG_INDEX_FILE, RAG_META_FILE
 from app.services.translator_service import translate, unload_translator
 from app.services.llm_service import llm_generate, llm_generate_stream, load_llm, unload_llm, local_gguf_path
-from app.services.rag_service import rag_add, rag_clear
+from app.services.rag_service import rag_add, rag_clear, rag_list, rag_retrieve
 
 def measure_time(fn, *args, **kwargs):
     """Utility to time any function call."""
@@ -733,5 +733,236 @@ def benchmark_translator_metrics(src_lang: str, tgt_lang: str = "en"):
     
     # Clean up
     unload_translator()
+    
+    return results
+
+
+def benchmark_rag_metrics(llm_name: str = None, n_ctx: int = 4096, n_gpu_layers: int = -1):
+    """
+    Comprehensive RAG performance metrics.
+    
+    Measures:
+    - Documents indexed count
+    - Index size on disk (MB)
+    - Query retrieval time
+    - Top-k retrieval time for different k values
+    - Memory usage with FAISS
+    - Recall/relevance (simulated with known queries)
+    - Impact of RAG on final answer quality
+    
+    Workflow:
+    1. Save existing RAG data
+    2. Clear RAG
+    3. Add demo data
+    4. Measure metrics
+    5. Clear RAG
+    6. Restore previous data
+    """
+    # Demo RAG documents for benchmarking
+    DEMO_DOCS = [
+        "Quantum computing uses quantum bits or qubits that can exist in superposition states, enabling parallel computation.",
+        "Machine learning is a subset of artificial intelligence that enables systems to learn from data without explicit programming.",
+        "The Transformer architecture revolutionized NLP by introducing self-attention mechanisms for processing sequential data.",
+        "BERT (Bidirectional Encoder Representations from Transformers) uses masked language modeling for pre-training.",
+        "GPT models are autoregressive language models trained on vast amounts of text data using next-token prediction.",
+        "Neural networks consist of layers of interconnected nodes that process information through weighted connections.",
+        "Backpropagation is the algorithm used to train neural networks by computing gradients of the loss function.",
+        "Convolutional Neural Networks (CNNs) are primarily used for image processing and computer vision tasks.",
+        "Recurrent Neural Networks (RNNs) process sequential data by maintaining hidden states across time steps.",
+        "Attention mechanisms allow models to focus on relevant parts of the input when making predictions.",
+    ]
+    
+    # Demo queries with expected relevant doc indices
+    DEMO_QUERIES = [
+        {"query": "What is quantum computing?", "relevant_docs": [0]},
+        {"query": "Explain transformers in NLP", "relevant_docs": [2, 3, 4]},
+        {"query": "How do neural networks learn?", "relevant_docs": [5, 6]},
+        {"query": "What are CNNs used for?", "relevant_docs": [7]},
+    ]
+    
+    results = {}
+    
+    # 1. Save existing RAG data
+    print("[RAG Benchmark] Saving existing RAG data...")
+    existing_docs = rag_list()
+    existing_count = len(existing_docs)
+    print(f"[RAG Benchmark] Found {existing_count} existing documents")
+    
+    # 2. Clear RAG
+    rag_clear()
+    gc.collect()
+    if torch.cuda.is_available() and not CPU_ONLY:
+        torch.cuda.empty_cache()
+    time.sleep(0.5)
+    
+    # Baseline memory before indexing
+    baseline_mem = memory_snapshot()
+    
+    # 3. Add demo data and measure indexing time
+    indexing_start = time.perf_counter()
+    doc_ids = []
+    for doc in DEMO_DOCS:
+        doc_id = rag_add(doc)
+        doc_ids.append(doc_id)
+    indexing_end = time.perf_counter()
+    indexing_time_s = indexing_end - indexing_start
+    
+    # Memory after indexing
+    indexed_mem = memory_snapshot()
+    
+    # 1. Documents indexed
+    indexed_count = len(rag_list())
+    results["documents_indexed"] = indexed_count
+    results["indexing_time_s"] = round(indexing_time_s, 3)
+    
+    # 2. Index size on disk
+    index_size_mb = 0
+    meta_size_mb = 0
+    if RAG_INDEX_FILE.exists():
+        index_size_mb = RAG_INDEX_FILE.stat().st_size / (1024 * 1024)
+    if RAG_META_FILE.exists():
+        meta_size_mb = RAG_META_FILE.stat().st_size / (1024 * 1024)
+    
+    results["index_size"] = {
+        "index_file_mb": round(index_size_mb, 4),
+        "metadata_file_mb": round(meta_size_mb, 4),
+        "total_mb": round(index_size_mb + meta_size_mb, 4),
+    }
+    
+    # 3 & 4. Query retrieval time and top-k retrieval
+    retrieval_times = []
+    topk_times = {1: [], 3: [], 5: []}
+    
+    for query_data in DEMO_QUERIES:
+        query = query_data["query"]
+        
+        # Measure single query time (top-3 default)
+        start = time.perf_counter()
+        _ = rag_retrieve(query, top_k=3)
+        end = time.perf_counter()
+        retrieval_times.append(end - start)
+        
+        # Measure different top-k values
+        for k in [1, 3, 5]:
+            start = time.perf_counter()
+            _ = rag_retrieve(query, top_k=k)
+            end = time.perf_counter()
+            topk_times[k].append(end - start)
+    
+    avg_retrieval_time_ms = (sum(retrieval_times) / len(retrieval_times)) * 1000
+    
+    results["retrieval_performance"] = {
+        "avg_query_time_ms": round(avg_retrieval_time_ms, 3),
+        "min_query_time_ms": round(min(retrieval_times) * 1000, 3),
+        "max_query_time_ms": round(max(retrieval_times) * 1000, 3),
+        "topk_avg_times_ms": {
+            k: round((sum(times) / len(times)) * 1000, 3)
+            for k, times in topk_times.items()
+        },
+    }
+    
+    # 5. Memory usage with FAISS
+    results["memory"] = {
+        "baseline_rss_mb": round(baseline_mem["rss_mb"], 2),
+        "after_indexing_rss_mb": round(indexed_mem["rss_mb"], 2),
+        "indexing_increase_mb": round(indexed_mem["rss_mb"] - baseline_mem["rss_mb"], 2),
+    }
+    
+    if torch.cuda.is_available() and not CPU_ONLY:
+        results["vram"] = {
+            "baseline_used_mb": round(baseline_mem["vram_used_mb"], 2),
+            "after_indexing_used_mb": round(indexed_mem["vram_used_mb"], 2),
+        }
+    
+    # 6. Recall/relevance measurement
+    recall_scores = []
+    for query_data in DEMO_QUERIES:
+        query = query_data["query"]
+        relevant_indices = set(query_data["relevant_docs"])
+        
+        # Get top-3 results
+        retrieved_docs = rag_retrieve(query, top_k=3)
+        
+        # Map retrieved docs back to original indices
+        retrieved_indices = set()
+        for retrieved_doc in retrieved_docs:
+            for idx, demo_doc in enumerate(DEMO_DOCS):
+                if demo_doc == retrieved_doc:
+                    retrieved_indices.add(idx)
+                    break
+        
+        # Calculate recall: how many relevant docs were retrieved
+        if len(relevant_indices) > 0:
+            recall = len(retrieved_indices & relevant_indices) / len(relevant_indices)
+            recall_scores.append(recall)
+    
+    avg_recall = sum(recall_scores) / len(recall_scores) if recall_scores else 0
+    
+    results["relevance"] = {
+        "avg_recall_at_3": round(avg_recall, 3),
+        "queries_evaluated": len(DEMO_QUERIES),
+        "perfect_recalls": sum(1 for r in recall_scores if r == 1.0),
+    }
+    
+    # 7. Impact of RAG on final answer (if LLM is available)
+    if llm_name:
+        try:
+            # Load LLM for answer quality comparison
+            load_llm(llm_name, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers)
+            
+            test_query = "What is quantum computing and how does it work?"
+            
+            # Answer WITHOUT RAG
+            no_rag_start = time.perf_counter()
+            answer_no_rag = llm_generate(test_query, max_new_tokens=64)
+            no_rag_time = time.perf_counter() - no_rag_start
+            
+            # Answer WITH RAG
+            rag_docs = rag_retrieve(test_query, top_k=3)
+            context = "\n".join(f"Context {i+1}: {d}" for i, d in enumerate(rag_docs))
+            prompt_with_rag = f"Context:\n{context}\n\nQuestion: {test_query}\nAnswer:"
+            
+            with_rag_start = time.perf_counter()
+            answer_with_rag = llm_generate(prompt_with_rag, max_new_tokens=64)
+            with_rag_time = time.perf_counter() - with_rag_start
+            
+            # Simple quality metrics
+            rag_impact = {
+                "query": test_query,
+                "answer_without_rag": answer_no_rag.strip(),
+                "answer_with_rag": answer_with_rag.strip(),
+                "answer_length_diff": len(answer_with_rag) - len(answer_no_rag),
+                "inference_time_without_rag_s": round(no_rag_time, 3),
+                "inference_time_with_rag_s": round(with_rag_time, 3),
+                "rag_overhead_s": round(with_rag_time - no_rag_time, 3),
+                "contexts_used": len(rag_docs),
+            }
+            
+            results["rag_impact"] = rag_impact
+            
+            # Unload LLM
+            unload_llm()
+            
+        except Exception as e:
+            results["rag_impact"] = {"error": f"LLM comparison failed: {e}"}
+    else:
+        results["rag_impact"] = {"skipped": "No LLM specified for impact analysis"}
+    
+    # 5. Clear RAG and restore previous data
+    print("[RAG Benchmark] Clearing demo data and restoring previous state...")
+    rag_clear()
+    
+    # Restore previous documents
+    if existing_docs:
+        for doc_data in existing_docs:
+            rag_add(doc_data["text"])
+    
+    restored_count = len(rag_list())
+    print(f"[RAG Benchmark] Restored {restored_count} documents")
+    
+    results["restoration"] = {
+        "original_doc_count": existing_count,
+        "restored_doc_count": restored_count,
+    }
     
     return results

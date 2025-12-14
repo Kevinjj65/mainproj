@@ -1,0 +1,20 @@
+meta {
+  name: Benchmark
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{dev}}/rag_metrics
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {}
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

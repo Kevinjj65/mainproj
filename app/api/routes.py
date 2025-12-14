@@ -9,7 +9,7 @@ from app.services.cache_service import model_cache
 from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, get_current_name, SERVER_URL
 from app.services.translator_service import translate, detect_supported_language, unload_translator
 from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear
-from app.services.benchmark_service import benchmark_pipeline, benchmark_resource_usage, benchmark_llm_metrics, benchmark_translator_metrics
+from app.services.benchmark_service import benchmark_pipeline, benchmark_resource_usage, benchmark_llm_metrics, benchmark_translator_metrics, benchmark_rag_metrics
 
 
 def _clean_generation(text: str) -> str:
@@ -706,6 +706,91 @@ def ep_translator_metrics():
         results = benchmark_translator_metrics(
             src_lang=src_lang,
             tgt_lang=tgt_lang
+        )
+        
+        if "error" in results:
+            return jsonify(results), 400
+        
+        return jsonify({"ok": True, **results})
+    except Exception as e:
+        return jsonify({
+            "error": "benchmark failed",
+            "details": str(e)
+        }), 500
+
+
+@bp.post("/rag_metrics")
+def ep_rag_metrics():
+    """
+    Measure detailed RAG performance metrics.
+    
+    Request body:
+    {
+        "llm_name": "Qwen2-500M-Instruct-GGUF",  // optional, for RAG impact analysis
+        "n_ctx": 4096,                           // optional, default 4096
+        "n_gpu_layers": -1                       // optional, default -1 (all)
+    }
+    
+    Returns:
+    {
+        "ok": true,
+        "documents_indexed": 10,
+        "indexing_time_s": 0.234,
+        "index_size": {
+            "index_file_mb": 0.0012,
+            "metadata_file_mb": 0.0008,
+            "total_mb": 0.0020
+        },
+        "retrieval_performance": {
+            "avg_query_time_ms": 2.5,
+            "min_query_time_ms": 1.8,
+            "max_query_time_ms": 3.2,
+            "topk_avg_times_ms": {
+                "1": 1.9,
+                "3": 2.5,
+                "5": 3.1
+            }
+        },
+        "memory": {
+            "baseline_rss_mb": 450.2,
+            "after_indexing_rss_mb": 452.8,
+            "indexing_increase_mb": 2.6
+        },
+        "relevance": {
+            "avg_recall_at_3": 0.85,
+            "queries_evaluated": 4,
+            "perfect_recalls": 2
+        },
+        "rag_impact": {
+            "query": "What is quantum computing and how does it work?",
+            "answer_without_rag": "...",
+            "answer_with_rag": "...",
+            "answer_length_diff": 45,
+            "inference_time_without_rag_s": 1.2,
+            "inference_time_with_rag_s": 1.5,
+            "rag_overhead_s": 0.3,
+            "contexts_used": 3
+        },
+        "restoration": {
+            "original_doc_count": 5,
+            "restored_doc_count": 5
+        }
+    }
+    
+    Note: This endpoint temporarily clears RAG data, runs benchmarks with demo data,
+    then restores the original RAG documents.
+    """
+    body = request.get_json() or {}
+    
+    llm_name = body.get("llm_name")
+    n_ctx = int(body.get("n_ctx", 4096))
+    n_gpu_layers = int(body.get("n_gpu_layers", -1))
+    
+    try:
+        results = benchmark_rag_metrics(
+            llm_name=llm_name,
+            n_ctx=n_ctx,
+            n_gpu_layers=n_gpu_layers
         )
         
         if "error" in results:

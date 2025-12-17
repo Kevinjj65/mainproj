@@ -271,7 +271,10 @@ def ep_infer():
     
     try:
         # 1. Convert user input → English (using short codes)
+        _t0 = time.perf_counter()
         english_text = translate(text, src_lang, "en")
+        _t1 = time.perf_counter()
+        translate_in_s = _t1 - _t0
         print(f"Translated input to English: {english_text}")
     except RuntimeError as e:
         if "torchvision" in str(e) or "nms" in str(e):
@@ -286,7 +289,10 @@ def ep_infer():
     stream = bool(body.get("stream", True))
 
     # 2. RAG retrieve
+    _r0 = time.perf_counter()
     rag_docs = rag_retrieve(english_text, top_k=3)
+    _r1 = time.perf_counter()
+    rag_retrieval_s = _r1 - _r0
     context = ""
     if rag_docs:
         context = "\n".join(f"Document {i+1}: {d}" for i, d in enumerate(rag_docs))
@@ -330,13 +336,18 @@ def ep_infer():
     sentence_end_re = re.compile(r"(.+?[.!?](?:\"|'|”)?)(\s+|$)", re.S)
 
     def event_stream():
+        llm_start = time.perf_counter()
+        translate_out_total_s = 0.0
+        english_output_raw = ""
+        english_output_clean = ""
         # Meta event with initial English input
-        meta = {"type": "meta", "english_in": english_text, "prompt": final_prompt, "lang_used": lang, "detected_lang": detected_lang}
+        meta = {"type": "meta", "english_in": english_text, "prompt": final_prompt, "lang_used": lang, "detected_lang": detected_lang, "rag_used": rag_docs, "rag_context": context}
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
         buffer = ""
         try:
             for chunk in llm_generate_stream(final_prompt, max_new_tokens=max_tokens):
+                english_output_raw += chunk
                 buffer += chunk
                 # extract complete sentences from buffer
                 while True:
@@ -351,7 +362,11 @@ def ep_infer():
                     sent_clean = _clean_generation(sent)
                     if not sent_clean:
                         continue
+                    _to0 = time.perf_counter()
                     translated = translate(sent_clean, "en", src_lang)
+                    _to1 = time.perf_counter()
+                    translate_out_total_s += (_to1 - _to0)
+                    english_output_clean += (sent_clean + " ")
                     payload = {"type": "sentence", "english": sent_clean, "translated": translated}
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -360,11 +375,31 @@ def ep_infer():
                 sent = buffer.strip()
                 sent_clean = _clean_generation(sent)
                 if sent_clean:
+                    _to0 = time.perf_counter()
                     translated = translate(sent_clean, "en", src_lang)
+                    _to1 = time.perf_counter()
+                    translate_out_total_s += (_to1 - _to0)
+                    english_output_clean += (sent_clean + " ")
                     payload = {"type": "sentence", "english": sent_clean, "translated": translated}
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+            llm_end = time.perf_counter()
+            total_llm_stream_s = llm_end - llm_start
+            total_pipeline_s = (time.perf_counter() - _t0)  # from initial translate start
+            final_payload = {
+                "type": "done",
+                "timing": {
+                    "translate_to_en_s": round(translate_in_s, 6),
+                    "rag_retrieval_s": round(rag_retrieval_s, 6),
+                    "llm_stream_s": round(total_llm_stream_s, 6),
+                    "translate_to_source_total_s": round(translate_out_total_s, 6),
+                    "total_pipeline_s": round(total_pipeline_s, 6),
+                },
+                "rag_used": rag_docs,
+                "llm_output_en_raw": english_output_raw.strip(),
+                "llm_output_en_clean": english_output_clean.strip(),
+            }
+            yield f"data: {json.dumps(final_payload, ensure_ascii=False)}\n\n"
         except Exception as e:
             err = {"type": "error", "message": str(e)}
             yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"

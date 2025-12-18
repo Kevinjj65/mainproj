@@ -299,11 +299,22 @@ def ep_infer():
 
     # 3. Build prompt for LLM
     context_block = f"Relevant context:\n{context}\n" if context else ""
-    final_prompt = (
-        f"User question:\n{english_text}\n\n"
-        f"{context_block}"
-        "Answer clearly in simple English. Do not use code fences or Markdown. Respond with plain text only."
-    )
+    final_prompt = f"""
+    You are an answer extraction engine.
+
+    RULES:
+    - Answer using ONLY the information present in the CONTEXT.
+    - Output ONE short sentence or phrase.
+
+    CONTEXT:
+    {context_block}
+
+    QUESTION:
+    {english_text}
+
+    ANSWER:
+    """
+    print(context_block)
 
     # 4/5. Run inference and (optionally) stream translations back
     if not stream:

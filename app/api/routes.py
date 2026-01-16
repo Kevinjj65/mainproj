@@ -1,3 +1,5 @@
+from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear, reindex_backend
+from app.services.rag_backend import available_backends, load_backend, get_active_backend_name
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 import json
 import re
@@ -536,6 +538,32 @@ def ep_rag_search():
         "results": results,
         "count": len(results)
     })
+
+@bp.get("/rag/backends")
+def ep_rag_backends():
+    """List available RAG backends and the currently active one."""
+    try:
+        backends = available_backends()
+        active = get_active_backend_name()
+        return jsonify({"ok": True, "available": backends, "active": active})
+    except Exception as e:
+        return jsonify({"error": "failed to list backends", "details": str(e)}), 500
+
+@bp.post("/rag/swap_backend")
+def ep_rag_swap_backend():
+    """Swap the active RAG backend and rebuild the index from current metadata."""
+    body = request.get_json() or {}
+    name = body.get("backend")
+    if not name:
+        return jsonify({"error": "backend name required"}), 400
+
+    try:
+        load_backend(name)
+        # rebuild index from existing metadata
+        reindex_backend()
+        return jsonify({"ok": True, "active": name})
+    except Exception as e:
+        return jsonify({"error": "failed to load backend", "details": str(e)}), 500
 
 @bp.post("/unload_llm")
 def ep_unload_llm():

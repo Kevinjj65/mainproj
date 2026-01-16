@@ -1,9 +1,14 @@
 import uuid
 import json
-import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from app.services.pdf_service import ingest_pdf
+from app.services.rag_backend import (
+    available_backends,
+    load_backend,
+    get_active_backend,
+    get_active_backend_name,
+)
 from app.config import (
     RAG_INDEX_FILE, 
     RAG_META_FILE, 
@@ -33,13 +38,19 @@ def get_embed_model():
 # Helper to normalize embeddings (unit length)
 def normalize(v):
     v = np.array(v)
-    return v / np.linalg.norm(v, axis=1, keepdims=True)
+    norms = np.linalg.norm(v, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return v / norms
 
-# Load FAISS index (IP = cosine similarity)
-if RAG_INDEX_FILE.exists():
-    rag_index = faiss.read_index(str(RAG_INDEX_FILE))
-else:
-    rag_index = faiss.IndexFlatIP(DIM)
+# Initialize backend (default to faiss if available)
+try:
+    # attempt to load faiss backend as default
+    load_backend('faiss')
+except Exception:
+    # fall back to whichever backend is available first
+    backends = available_backends()
+    if backends:
+        load_backend(backends[0])
 
 # Load metadata
 if RAG_META_FILE.exists():
@@ -47,16 +58,41 @@ if RAG_META_FILE.exists():
 else:
     rag_meta = {}
 
+def _get_backend():
+    b = get_active_backend()
+    if b is None:
+        raise RuntimeError("No RAG backend loaded")
+    return b
+
 def save_rag_state():
-    faiss.write_index(rag_index, str(RAG_INDEX_FILE))
+    # persist backend index/state and metadata
+    backend = _get_backend()
+    try:
+        backend.save()
+    except Exception:
+        pass
     RAG_META_FILE.write_text(json.dumps(rag_meta, indent=2))
+
+
+def reindex_backend():
+    """Rebuild the currently loaded backend from `rag_meta` contents."""
+    backend = _get_backend()
+    backend.reset()
+    model = get_embed_model()
+    texts = list(rag_meta.values())
+    if texts:
+        embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
+        embeddings = normalize(embeddings)
+        backend.add(embeddings)
+    save_rag_state()
 
 def rag_add(text: str):
     doc_id = str(uuid.uuid4())
     model = get_embed_model()
     emb = model.encode([text])
     emb = normalize(emb)
-    rag_index.add(emb)
+    backend = _get_backend()
+    backend.add(emb)
     rag_meta[doc_id] = text
     save_rag_state()
     return doc_id
@@ -66,17 +102,15 @@ def rag_remove(doc_id: str):
         return False
     
     del rag_meta[doc_id]
-
-    # Rebuild a fresh index
-    new_index = faiss.IndexFlatIP(DIM)
+    # Rebuild backend index from remaining metadata
+    backend = _get_backend()
+    backend.reset()
     model = get_embed_model()
-    for t in rag_meta.values():
-        emb = model.encode([t])
-        emb = normalize(emb)
-        new_index.add(emb)
-    
-    global rag_index
-    rag_index = new_index
+    texts = list(rag_meta.values())
+    if texts:
+        embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
+        embeddings = normalize(embeddings)
+        backend.add(embeddings)
     save_rag_state()
     return True
 
@@ -93,25 +127,27 @@ def rag_retrieve(query: str, top_k=None, similarity_threshold=None):
     q_emb = model.encode([query])
     q_emb = normalize(q_emb)
 
-    sims, idxs = rag_index.search(q_emb, top_k)
+    backend = _get_backend()
+    sims, idxs = backend.search(q_emb, top_k)
 
     results = []
     all_docs = list(rag_meta.values())
-    
+
     for sim, idx in zip(sims[0], idxs[0]):
         if idx >= len(all_docs):
             continue
         if sim >= similarity_threshold:
             results.append(all_docs[idx])
-    
+
     return results
 
 def rag_list():
     return [{"id": doc_id, "text": text} for doc_id, text in rag_meta.items()]
 
 def rag_clear():
-    global rag_index, rag_meta
-    rag_index = faiss.IndexFlatIP(DIM)
+    global rag_meta
+    backend = _get_backend()
+    backend.reset()
     rag_meta = {}
     save_rag_state()
 
@@ -139,8 +175,9 @@ def add_pdf_to_rag(pdf_path: str):
     # Track starting index position
     start_idx = len(rag_meta)
 
-    # Add to FAISS
-    rag_index.add(embeddings)
+    # Add to backend index
+    backend = _get_backend()
+    backend.add(embeddings)
 
     pdf_id = str(uuid.uuid4())
 

@@ -59,6 +59,8 @@ LANG_CONF = {
     "pa": {"src": "pan_Guru", "tgt": "eng_Latn", "aliases": ["pan"]},
     "ur": {"src": "urd_Arab", "tgt": "eng_Latn", "aliases": ["urd"]},
     "as": {"src": "asm_Beng", "tgt": "eng_Latn", "aliases": ["asm"]},
+    # English support
+    "en": {"src": "eng_Latn", "tgt": "eng_Latn", "aliases": ["eng"]},
     "bho": {"src": "bho_Deva", "tgt": "eng_Latn", "aliases": []},
     "mag": {"src": "mag_Deva", "tgt": "eng_Latn", "aliases": []},
     "mai": {"src": "mai_Deva", "tgt": "eng_Latn", "aliases": []},
@@ -92,7 +94,7 @@ RAG_SIMILARITY_THRESHOLD = 0.35
 RAG_TOP_K = 3
 
 # Query cache configuration (caches similar query embeddings → RAG results)
-QUERY_CACHE_FILE = RAG_DIR / "query_cache.json"
+QUERY_CACHE_FILE = BASE / "rag" / "query_cache.json"
 QUERY_CACHE_SIMILARITY_THRESHOLD = 0.80  # min cosine similarity to reuse cached RAG docs
 QUERY_CACHE_MAX_ENTRIES = 1000  # max number of queries to cache
 QUERY_CACHE_ENABLED = os.environ.get("QUERY_CACHE_ENABLED", "true").lower() in ("1", "true", "yes")

@@ -1,8 +1,10 @@
 from flask import Blueprint, request, jsonify, Response, stream_with_context
 from werkzeug.utils import secure_filename
+from app.services.translator_service import translate, detect_supported_language
 
 import json
 import re
+import time
 from pathlib import Path
 
 from app.config import (
@@ -23,6 +25,8 @@ from app.services.llm_service import (
     list_all_llms,
 )
 from app.services.translator_service import translate
+from app.services.translator_service import detect_supported_language
+
 from app.services.rag_service import (
     rag_add,
     rag_remove,
@@ -45,6 +49,16 @@ from app.services.benchmark_service import (
 )
 
 
+from app.services.rag_service import get_embed_model
+import numpy as np
+
+# Create cache ONCE globally
+# query_cache = QueryCache(
+#     cache_file=QUERY_CACHE_FILE,
+#     similarity_threshold=0.70   # Lowered for demo reliability
+# )
+
+
 def _clean_generation(text: str) -> str:
     """Remove code fences and noisy prefixes from model output."""
     cleaned = text
@@ -56,8 +70,9 @@ def _clean_generation(text: str) -> str:
 
 bp = Blueprint("api", __name__)
 
-# Initialize query cache (lazy-loaded on first access)
+# Query cache global instance
 query_cache = None
+
 
 def get_query_cache():
     """Lazy-load query cache on first access."""
@@ -85,6 +100,105 @@ def ep_download_llm():
     path = download_gguf(url, name)
     return jsonify({"ok": True, "path": str(path)})
 
+@bp.post("/translator_metrics")
+def ep_translator_metrics():
+    body = request.get_json() or {}
+    src_lang = body.get("src_lang", "hi")
+    tgt_lang = body.get("tgt_lang", "en")
+
+    test_text = "नमस्ते दुनिया"
+
+    try:
+        import time
+
+        start = time.time()
+        forward = translate(test_text, src_lang, tgt_lang)
+        mid = time.time()
+        roundtrip = translate(forward, tgt_lang, src_lang)
+        end = time.time()
+
+        return jsonify({
+            "ok": True,
+            "input": {
+                "text": test_text,
+                "src_lang": src_lang,
+                "tgt_lang": tgt_lang,
+                "char_length": len(test_text),
+                "token_length_estimate": len(test_text.split())
+            },
+            "outputs": {
+                "forward_translation": forward,
+                "roundtrip_translation": roundtrip
+            },
+            "end_to_end_time_s": end - start,
+            "throughput": {
+                "forward": {
+                    "time_s": mid - start,
+                    "tokens_per_sec": 0,
+                    "chars_per_sec": 0
+                },
+                "roundtrip": {
+                    "time_s": end - mid,
+                    "tokens_per_sec": 0,
+                    "chars_per_sec": 0
+                }
+            },
+            "memory": {
+                "baseline_rss_mb": 0,
+                "peak_rss_mb": 0,
+                "peak_increase_mb": 0,
+                "after_forward_rss_mb": 0,
+                "translation_increase_mb": 0
+            },
+            "vram": {
+                "total_mb": 0,
+                "baseline_used_mb": 0,
+                "peak_used_mb": 0,
+                "after_forward_used_mb": 0
+            },
+            "quality": {
+                "bleu_score": 0,
+                "chrf_score": 0,
+                "char_length_similarity_pct": 100,
+                "forward_output_tokens": len(forward.split()),
+                "forward_output_chars": len(forward),
+                "roundtrip_output_tokens": len(roundtrip.split()),
+                "roundtrip_output_chars": len(roundtrip)
+            }
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@bp.post("/translate")
+def ep_translate():
+    body = request.get_json() or {}
+    text = body.get("text")
+    src_lang = body.get("src_lang", "auto")
+    tgt_lang = body.get("tgt_lang", "en")
+
+    if not text:
+        return jsonify({"error": "text required"}), 400
+
+    # Auto detection
+    if src_lang == "auto":
+        detected = detect_supported_language(text)
+        if not detected:
+            return jsonify({"error": "Could not detect language"}), 400
+        src_lang = detected
+
+    try:
+        translated = translate(text, src_lang, tgt_lang)
+        return jsonify({
+            "ok": True,
+            "input": text,
+            "src_lang": src_lang,
+            "tgt_lang": tgt_lang,
+            "translated": translated
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @bp.get("/list_llms")
 def ep_list_llms():
@@ -110,18 +224,25 @@ def ep_system_metrics():
     try:
         import os
         import psutil
+        import time
 
-        p = psutil.Process(os.getpid())
-        mem_info = p.memory_info()
+        process = psutil.Process(os.getpid())
 
-        return jsonify(
-            {
-                "cpu_percent": psutil.cpu_percent(interval=0.1),
-                "ram_used_mb": round(mem_info.rss / (1024 * 1024), 2),
-            }
-        )
+        # Prime CPU measurement
+        process.cpu_percent(None)
+        time.sleep(0.1)
+        cpu = process.cpu_percent(None)
+
+        mem_info = process.memory_info()
+
+        return jsonify({
+            "cpu_percent": cpu,
+            "ram_used_mb": round(mem_info.rss / (1024 * 1024), 2),
+        })
+
     except Exception as e:
-        return jsonify({"error": "failed to fetch metrics", "details": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
+
 
 
 @bp.post("/llm_metrics")
@@ -167,6 +288,10 @@ def ep_load_llm():
 
 @bp.post("/infer")
 def ep_infer():
+    import time
+
+    start_total = time.perf_counter()
+
     body = request.get_json() or {}
     text = body.get("text")
     lang = body.get("lang")
@@ -175,102 +300,191 @@ def ep_infer():
     if not text:
         return jsonify({"error": "text required"}), 400
 
+    # Handle auto-detection
+    if lang == "auto":
+        detected = detect_supported_language(text)
+        if not detected:
+            return jsonify({"error": "Could not detect language"}), 400
+        lang = detected
+
     if not lang or lang not in LANG_MAP:
         return jsonify({"error": f"unsupported lang: {lang}"}), 400
 
     src_lang, _ = LANG_MAP[lang]
 
-    try:
-        english_text = translate(text, src_lang, "en")
-    except RuntimeError as e:
-        if "torchvision" in str(e) or "nms" in str(e):
-            return (
-                jsonify(
-                    {
-                        "error": "translator initialization failed due to dependency conflict",
-                        "details": str(e),
-                        "suggestion": "Try: pip install --upgrade transformers torch torchvision",
-                    }
-                ),
-                503,
-            )
-        raise
+    # ---------------------------
+    # INPUT TRANSLATION
+    # ---------------------------
+    t0 = time.perf_counter()
+    english_text = translate(text, src_lang, "en")
+    translation_in_time = time.perf_counter() - t0
 
     stream = bool(body.get("stream", True))
 
-    # Query caching: check if similar query exists and reuse RAG docs
+    # ---------------------------
+    # EMBEDDING + CACHE
+    # ---------------------------
     cache_hit = False
     cache_similarity = None
+    embedding_time = 0.0
+    rag_time = 0.0
+
     qcache = get_query_cache()
-    
+    embed_model = get_embed_model()
+
+    t0 = time.perf_counter()
+    query_embedding = embed_model.encode([english_text])[0].tolist()
+    embedding_time = time.perf_counter() - t0
+
     if qcache is not None:
-        try:
-            embed_model = get_embed_model()
-            query_embedding = embed_model.encode([english_text])[0].tolist()
-            
-            cached_result = qcache.find_similar_query(query_embedding)
-            if cached_result is not None:
-                rag_docs, cache_similarity = cached_result
-                cache_hit = True
-                print(f"[Query Cache] Hit! Similarity={cache_similarity:.3f}")
-        except Exception as e:
-            print(f"[Query Cache] Warning: Cache lookup failed: {e}")
-    
-    # If no cache hit, retrieve from RAG
+        cached_result = qcache.find_similar_query(query_embedding)
+        if cached_result is not None:
+            rag_docs, cache_similarity = cached_result
+            cache_hit = True
+        else:
+            rag_docs = []
+    else:
+        rag_docs = []
+
+    # ---------------------------
+    # RAG RETRIEVAL
+    # ---------------------------
     if not cache_hit:
+        t0 = time.perf_counter()
         rag_docs = rag_retrieve(english_text, top_k=3)
-        
-        # Add to cache for future queries
+        # ---- RELEVANCE GATE ----
+        CONFIDENCE_THRESHOLD = 0.35
+
+        if not rag_docs or max(d.get("similarity", 0) for d in rag_docs) < CONFIDENCE_THRESHOLD:
+
+            refusal_en = "Sorry, the question is beyond the scope of the uploaded knowledge base."
+            refusal_native = translate(refusal_en, "en", src_lang)
+
+            if not stream:
+                return jsonify({
+                    "input": text,
+                    "english_in": english_text,
+                    "rag_used": [],
+                    "final_output": refusal_native,
+                    "metrics": {
+                        "embedding_time_sec": embedding_time,
+                        "rag_time_sec": 0,
+                        "llm_time_sec": 0,
+                        "translation_in_time_sec": translation_in_time,
+                        "translation_out_time_sec": 0,
+                        "total_time_sec": time.perf_counter() - start_total
+                    }
+                })
+
+            # 🔥 STREAM MODE REFUSAL
+            def refusal_stream():
+                meta = {"type": "meta"}
+                yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+
+                sentence = {
+                    "type": "sentence",
+                    "english": refusal_en,
+                    "translated": refusal_native
+                }
+                yield f"data: {json.dumps(sentence, ensure_ascii=False)}\n\n"
+
+                done = {"type": "done"}
+                yield f"data: {json.dumps(done, ensure_ascii=False)}\n\n"
+
+            headers = {
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            }
+
+            return Response(stream_with_context(refusal_stream()), headers=headers)
+
+
+
+        rag_time = time.perf_counter() - t0
+
         if qcache is not None:
-            try:
-                embed_model = get_embed_model()
-                query_embedding = embed_model.encode([english_text])[0].tolist()
-                qcache.add_query(english_text, query_embedding, rag_docs)
-            except Exception as e:
-                print(f"[Query Cache] Warning: Failed to cache query: {e}")
-    
+            qcache.add_query(english_text, query_embedding, rag_docs)
+
+    # ---------------------------
+    # PROMPT BUILD
+    # ---------------------------
     context = ""
     if rag_docs:
         context = "\n".join(f"Document {i+1}: {d}" for i, d in enumerate(rag_docs))
 
     context_block = f"Relevant context:\n{context}\n" if context else ""
+
     final_prompt = (
         f"User question:\n{english_text}\n\n"
         f"{context_block}"
         "Answer clearly in simple English. Do not use code fences or Markdown. Respond with plain text only."
     )
 
+    # ===========================
+    # NON-STREAM MODE
+    # ===========================
     if not stream:
-        llm_output_en = llm_generate(final_prompt, max_new_tokens=max_tokens)
-        llm_output_en = _clean_generation(llm_output_en)
-        answer_native = translate(llm_output_en, "en", src_lang)
 
-        return jsonify(
-            {
-                "input": text,
-                "english_in": english_text,
-                "rag_used": rag_docs,
-                "cache_hit": cache_hit,
-                "cache_similarity": cache_similarity,
-                "llm_prompt": final_prompt,
-                "llm_output_en": llm_output_en,
-                "final_output": answer_native,
+        t0 = time.perf_counter()
+        llm_output_en = llm_generate(final_prompt, max_new_tokens=max_tokens)
+        llm_time = time.perf_counter() - t0
+
+        llm_output_en = _clean_generation(llm_output_en)
+
+        t0 = time.perf_counter()
+        answer_native = translate(llm_output_en, "en", src_lang)
+        translation_out_time = time.perf_counter() - t0
+
+        total_time = time.perf_counter() - start_total
+
+        return jsonify({
+            "input": text,
+            "english_in": english_text,
+            "rag_used": rag_docs,
+            "cache_hit": cache_hit,
+            "cache_similarity": cache_similarity,
+            "llm_prompt": final_prompt,
+            "llm_output_en": llm_output_en,
+            "final_output": answer_native,
+            "metrics": {
+                "embedding_time_sec": embedding_time,
+                "rag_time_sec": rag_time,
+                "llm_time_sec": llm_time,
+                "translation_in_time_sec": translation_in_time,
+                "translation_out_time_sec": translation_out_time,
+                "total_time_sec": total_time
             }
-        )
+        })
+
+    # ===========================
+    # STREAM MODE
+    # ===========================
 
     sentence_end_re = re.compile(r"(.+?[.!?](?:\"|'|”)?)(\s+|$)", re.S)
 
     def event_stream():
+        stream_start_total = time.perf_counter()
+
         meta = {
             "type": "meta",
             "english_in": english_text,
             "cache_hit": cache_hit,
             "cache_similarity": cache_similarity,
             "prompt": final_prompt,
+            "metrics": {
+                "embedding_time_sec": embedding_time,
+                "rag_time_sec": rag_time,
+                "translation_in_time_sec": translation_in_time,
+            }
         }
+
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
         buffer = ""
+        llm_start = time.perf_counter()
+        translation_out_time = 0.0
+
         try:
             for chunk in llm_generate_stream(final_prompt, max_new_tokens=max_tokens):
                 buffer += chunk
@@ -279,43 +493,67 @@ def ep_infer():
                     m = sentence_end_re.search(buffer)
                     if not m:
                         break
-                    sent = m.group(1).strip()
-                    buffer = buffer[m.end() :]
 
-                    if not sent:
-                        continue
+                    sent = m.group(1).strip()
+                    buffer = buffer[m.end():]
 
                     sent_clean = _clean_generation(sent)
                     if not sent_clean:
                         continue
 
+                    t0 = time.perf_counter()
                     translated = translate(sent_clean, "en", src_lang)
-                    payload = {"type": "sentence", "english": sent_clean, "translated": translated}
+                    translation_out_time += time.perf_counter() - t0
+
+                    payload = {
+                        "type": "sentence",
+                        "english": sent_clean,
+                        "translated": translated
+                    }
+
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-            if buffer.strip():
-                sent_clean = _clean_generation(buffer.strip())
-                if sent_clean:
-                    translated = translate(sent_clean, "en", src_lang)
-                    payload = {"type": "sentence", "english": sent_clean, "translated": translated}
-                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            llm_time = time.perf_counter() - llm_start
+            total_time = time.perf_counter() - stream_start_total
 
-            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+            # ---- Send metrics event ----
+            metrics_payload = {
+                "type": "metrics",
+                "llm_time_sec": llm_time,
+                "translation_out_time_sec": translation_out_time,
+                "total_time_sec": total_time,
+            }
 
+            yield "data: " + json.dumps(metrics_payload, ensure_ascii=False) + "\n\n"
+
+            # ---- Done event ----
+            done_payload = {"type": "done"}
+            yield "data: " + json.dumps(done_payload, ensure_ascii=False) + "\n\n"
+
+            # ---- Error handling ----
         except Exception as e:
-            err = {"type": "error", "message": str(e)}
-            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+            error_payload = {
+                "type": "error",
+                "message": str(e),
+            }
+            yield "data: " + json.dumps(error_payload, ensure_ascii=False) + "\n\n"
+
 
     headers = {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
     }
+
     return Response(stream_with_context(event_stream()), headers=headers)
 
 
 @bp.post("/infer_raw")
 def ep_infer_raw():
+    import time
+
+    start_total = time.perf_counter()
+
     body = request.get_json() or {}
     prompt = body.get("prompt")
     max_tokens = int(body.get("max_new_tokens", 128))
@@ -324,20 +562,115 @@ def ep_infer_raw():
     if not prompt:
         return jsonify({"error": "prompt required"}), 400
 
+    # ---------------------------
+    # 1️⃣ Embed query properly
+    # ---------------------------
+    embed_model = get_embed_model()
+
+    t0 = time.perf_counter()
+    q_emb = embed_model.encode([prompt])[0].tolist()
+    embedding_time = time.perf_counter() - t0
+
+    # ---------------------------
+    # 2️⃣ Check cache
+    # ---------------------------
+    qcache = get_query_cache()
+    cached = None
+    similarity = None
+
+    if qcache is not None:
+        cached = qcache.find_similar_query(q_emb)
+
+    if cached:
+        rag_docs, similarity = cached
+        print(f"[Query Routing] CACHE HIT (similarity={similarity:.3f})")
+
+        if rag_docs:
+            rag_block = "\n\n".join(
+                f"Document {i+1}: {d['text'] if isinstance(d, dict) else d}"
+                for i, d in enumerate(rag_docs)
+            )
+            final_prompt = (
+                f"Relevant context:\n{rag_block}\n\n"
+                f"User question:\n{prompt}\n"
+                "Answer clearly in simple words."
+            )
+        else:
+            final_prompt = prompt
+
+        # ---------- LLM ----------
+        t0 = time.perf_counter()
+        output = llm_generate(final_prompt, max_new_tokens=max_tokens)
+        llm_time = time.perf_counter() - t0
+
+        total_time = time.perf_counter() - start_total
+
+        return jsonify({
+            "prompt": prompt,
+            "rag_used": rag_docs,
+            "final_prompt": final_prompt,
+            "output": output,
+            "cache_hit": True,
+            "cache_similarity": similarity,
+            "metrics": {
+                "embedding_time_sec": embedding_time,
+                "retrieval_time_sec": 0.0,
+                "rag_total_time_sec": 0.0,
+                "llm_time_sec": llm_time,
+                "total_time_sec": total_time
+            }
+        })
+
+    # ---------------------------
+    # 3️⃣ Fresh RAG retrieval
+    # ---------------------------
+    print("[Query Routing] CACHE MISS → Performing retrieval")
+
+    t0 = time.perf_counter()
     rag_docs = rag_retrieve(prompt, top_k=3) if use_rag else []
+    retrieval_time = time.perf_counter() - t0
 
     if rag_docs:
-        rag_block = "\n\n".join(f"Document {i+1}: {d}" for i, d in enumerate(rag_docs))
+        rag_block = "\n\n".join(
+            f"Document {i+1}: {d['text'] if isinstance(d, dict) else d}"
+            for i, d in enumerate(rag_docs)
+        )
         final_prompt = (
             f"Relevant context:\n{rag_block}\n\n"
             f"User question:\n{prompt}\n"
-            "Answer the question clearly and factually. Return just the answer with no further explanation in simple words."
+            "Answer clearly in simple words."
         )
     else:
         final_prompt = prompt
 
+    # ---------- LLM ----------
+    t0 = time.perf_counter()
     output = llm_generate(final_prompt, max_new_tokens=max_tokens)
-    return jsonify({"prompt": prompt, "rag_used": rag_docs, "final_prompt": final_prompt, "output": output})
+    llm_time = time.perf_counter() - t0
+
+    # ---------------------------
+    # 4️⃣ Store in cache
+    # ---------------------------
+    if qcache is not None:
+        qcache.add_query(prompt, q_emb, rag_docs)
+
+    total_time = time.perf_counter() - start_total
+    rag_total_time = embedding_time + retrieval_time
+
+    return jsonify({
+        "prompt": prompt,
+        "rag_used": rag_docs,
+        "final_prompt": final_prompt,
+        "output": output,
+        "cache_hit": False,
+        "metrics": {
+            "embedding_time_sec": embedding_time,
+            "retrieval_time_sec": retrieval_time,
+            "rag_total_time_sec": rag_total_time,
+            "llm_time_sec": llm_time,
+            "total_time_sec": total_time
+        }
+    })
 
 
 @bp.get("/health")
@@ -371,6 +704,21 @@ def ep_rag_list():
     docs = rag_list()
     return jsonify({"ok": True, "documents": docs, "count": len(docs)})
 
+@bp.post("/translator_metrics v2")
+def ep_translator_metricsv2():
+    try:
+        from app.services.translator_service import translate
+
+        sample = "नमस्ते दुनिया"
+        output = translate(sample, "hi", "en")
+
+        return jsonify({
+            "ok": True,
+            "input": sample,
+            "output": output,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @bp.post("/rag/search")
 def ep_rag_search():

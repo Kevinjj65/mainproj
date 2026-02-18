@@ -8,12 +8,13 @@ import os
 import tempfile
 from werkzeug.utils import secure_filename
 import psutil
-from app.config import LANG_MAP, LANG_ALIASES, NLLB_LANG_MAP
+from app.config import LANG_MAP, LANG_ALIASES, NLLB_LANG_MAP, USE_ONNX_TRANSLATOR, ONNX_LANG_MAP
 from app.services.cache_service import model_cache
 from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, get_current_name, SERVER_URL
-from app.services.translator_service import translate, detect_supported_language, unload_translator
+from app.services.translator_service import translate, detect_supported_language, unload_translator, preload_translator
 from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear, add_pdf_to_rag
 from app.services.benchmark_service import benchmark_pipeline, benchmark_resource_usage, benchmark_llm_metrics, benchmark_translator_metrics, benchmark_rag_metrics
+from app.services.onnx_translator_service import translate_onnx, get_onnx_status, unload_onnx_translator, preload_onnx_translator
 
 
 def _clean_generation(text: str) -> str:
@@ -68,6 +69,68 @@ def ep_current_llm():
         "server_url": SERVER_URL
     })
 
+@bp.get("/translator_status")
+def ep_translator_status():
+    """Get status of available translators (NLLB and ONNX)."""
+    onnx_status = get_onnx_status()
+    return jsonify({
+        "active_translator": "onnx" if USE_ONNX_TRANSLATOR and onnx_status["available"] else "nllb",
+        "onnx": onnx_status,
+        "nllb": {
+            "available": True,
+            "model": "facebook/nllb-200-distilled-600M"
+        }
+    })
+
+@bp.post("/toggle_translator")
+def ep_toggle_translator():
+    """Toggle between ONNX and NLLB translator."""
+    body = request.get_json() or {}
+    use_onnx = body.get("use_onnx", not USE_ONNX_TRANSLATOR)
+    
+    onnx_status = get_onnx_status()
+    if use_onnx and not onnx_status["available"]:
+        return jsonify({
+            "error": "ONNX models not available",
+            "details": onnx_status
+        }), 503
+    
+    if use_onnx:
+        print("[API] Switching to ONNX translator")
+        unload_translator()  # Clean up NLLB if loaded
+    else:
+        print("[API] Switching to NLLB translator")
+        unload_onnx_translator()  # Clean up ONNX if loaded
+    
+    return jsonify({
+        "ok": True,
+        "active_translator": "onnx" if use_onnx else "nllb"
+    })
+
+
+@bp.post("/translator_preload")
+def ep_translator_preload():
+    """Preload translator models without running a translation."""
+    body = request.get_json() or {}
+    use_onnx = body.get("use_onnx", USE_ONNX_TRANSLATOR)
+
+    if use_onnx:
+        onnx_status = get_onnx_status()
+        if not onnx_status["available"]:
+            return jsonify({
+                "error": "ONNX models not available",
+                "details": onnx_status
+            }), 503
+        details = preload_onnx_translator()
+    else:
+        details = preload_translator()
+
+    return jsonify({
+        "ok": True,
+        "active_translator": "onnx" if use_onnx else "nllb",
+        "details": details,
+    })
+
 @bp.post("/translate")
 def ep_translate():
     body = request.get_json() or {}
@@ -75,6 +138,7 @@ def ep_translate():
     target = (body.get("target") or "en").lower()
     stream = bool(body.get("stream", True))
     max_tokens = int(body.get("max_new_tokens", 256))
+    use_onnx = body.get("use_onnx", USE_ONNX_TRANSLATOR)
 
     if not text:
         return jsonify({"error": "text required"}), 400
@@ -84,12 +148,33 @@ def ep_translate():
     if not src_lang_key:
         return jsonify({"error": "could not auto-detect a supported language"}), 400
 
-    src_code, _ = LANG_MAP[src_lang_key]
+    # Determine which language map and translation function to use
+    if use_onnx:
+        target_map = ONNX_LANG_MAP
+        translate_fn = translate_onnx
+        backend = "onnx"
+        # For ONNX, use short codes (e.g., "hi" instead of "hin_Deva")
+        src_code = src_lang_key
+        
+        # Check if ONNX supports the detected language
+        if src_lang_key not in ONNX_LANG_MAP:
+            supported_langs = ", ".join(sorted(ONNX_LANG_MAP.keys()))
+            return jsonify({
+                "error": f"Language '{src_lang_key}' not supported by ONNX model",
+                "details": f"ONNX supports: {supported_langs}",
+                "suggestion": "Switch to NLLB translator or use a supported language"
+            }), 400
+    else:
+        target_map = NLLB_LANG_MAP
+        translate_fn = translate
+        backend = "nllb"
+        # For NLLB, use long codes from LANG_MAP (e.g., "hin_Deva")
+        src_code, _ = LANG_MAP[src_lang_key]
 
     # Normalize target and validate it against known mappings or raw NLLB codes
     target_key = LANG_ALIASES.get(target, target)
-    target_code = NLLB_LANG_MAP.get(target_key, target_key)
-    if target_key not in LANG_MAP and target_key not in NLLB_LANG_MAP and "_" not in target_key:
+    target_code = target_map.get(target_key, target_key)
+    if target_key not in LANG_MAP and target_key not in target_map and "_" not in target_key:
         return jsonify({"error": f"unsupported target language: {target}"}), 400
 
     # Helper to iterate sentences from paragraphs
@@ -111,9 +196,16 @@ def ep_translate():
     if not stream:
         translated_sentences = []
         for sent in iter_sentences(text):
+            try:
+                translated = translate_fn(sent, src_code, target_code, max_tokens)
+            except Exception as e:
+                return jsonify({
+                    "error": f"{backend} translation failed",
+                    "details": str(e)
+                }), 503
             translated_sentences.append({
                 "source": sent,
-                "translated": translate(sent, src_code, target_code, max_tokens),
+                "translated": translated,
             })
 
         combined = " ".join(item["translated"] for item in translated_sentences)
@@ -123,6 +215,7 @@ def ep_translate():
             "target_lang": target_key,
             "translated_text": combined,
             "sentences": translated_sentences,
+            "backend": backend,
         })
 
     def event_stream():
@@ -130,12 +223,18 @@ def ep_translate():
             "type": "meta",
             "detected_lang": src_lang_key,
             "target_lang": target_key,
+            "backend": backend,
         }
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
         try:
             for idx, sent in enumerate(iter_sentences(text), start=1):
-                translated = translate(sent, src_code, target_code, max_tokens)
+                try:
+                    translated = translate_fn(sent, src_code, target_code, max_tokens)
+                except Exception as e:
+                    err = {"type": "error", "message": f"{backend} translation failed: {str(e)}"}
+                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+                    return
                 payload = {
                     "type": "sentence",
                     "index": idx,
@@ -802,6 +901,7 @@ def ep_translator_metrics():
     
     src_lang = body.get("src_lang")
     tgt_lang = body.get("tgt_lang", "en")
+    use_onnx = body.get("use_onnx", USE_ONNX_TRANSLATOR)
     
     if not src_lang:
         return jsonify({"error": "src_lang required"}), 400
@@ -813,7 +913,8 @@ def ep_translator_metrics():
     try:
         results = benchmark_translator_metrics(
             src_lang=src_lang,
-            tgt_lang=tgt_lang
+            tgt_lang=tgt_lang,
+            use_onnx=use_onnx
         )
         
         if "error" in results:

@@ -16,7 +16,7 @@ from app.services.translator_service import translate, detect_supported_language
 from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear, add_pdf_to_rag, get_embed_model
 from app.services.benchmark_service import benchmark_pipeline, benchmark_resource_usage, benchmark_llm_metrics, benchmark_translator_metrics, benchmark_rag_metrics
 from app.services.onnx_translator_service import translate_onnx, get_onnx_status, unload_onnx_translator, preload_onnx_translator
-from app.services.onnx_model_download_service import get_onnx_catalog, download_onnx_models
+from app.services.onnx_model_download_service import get_onnx_catalog, download_onnx_models, ensure_onnx_tokenizer
 from app.services.query_cache_service import QueryCache
 
 
@@ -160,6 +160,27 @@ def ep_onnx_models_download():
 def ep_onnx_models_download_api_alias():
     """Alias for clients expecting /api-prefixed ONNX download route."""
     return ep_onnx_models_download()
+
+
+@bp.post("/onnx_tokenizer/ensure")
+def ep_onnx_tokenizer_ensure():
+    """Ensure ONNX tokenizer assets exist locally, downloading if required."""
+    body = request.get_json(silent=True) or {}
+    force_download = body.get("force_download", False)
+    if not isinstance(force_download, bool):
+        return jsonify({"error": "force_download must be a boolean"}), 400
+
+    try:
+        details = ensure_onnx_tokenizer(force_download=force_download)
+        return jsonify({"ok": True, **details})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.post("/api/onnx_tokenizer/ensure")
+def ep_onnx_tokenizer_ensure_api_alias():
+    """Alias for clients expecting /api-prefixed ONNX tokenizer ensure route."""
+    return ep_onnx_tokenizer_ensure()
 
 @bp.post("/toggle_translator")
 def ep_toggle_translator():

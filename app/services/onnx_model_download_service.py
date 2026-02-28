@@ -108,11 +108,28 @@ def _destination_for_model(filename: str) -> Path:
 
 
 def is_onnx_tokenizer_ready() -> bool:
-    required = [
-        ONNX_TOKENIZER_DIR / "tokenizer_config.json",
+    if not ONNX_TOKENIZER_DIR.exists():
+        return False
+
+    required_config = ONNX_TOKENIZER_DIR / "tokenizer_config.json"
+    if (not required_config.exists()) or required_config.stat().st_size <= 0:
+        return False
+
+    candidate_tokenizer_assets = [
         ONNX_TOKENIZER_DIR / "sentencepiece.bpe.model",
+        ONNX_TOKENIZER_DIR / "sentencepiece.model",
+        ONNX_TOKENIZER_DIR / "tokenizer.model",
+        ONNX_TOKENIZER_DIR / "tokenizer.json",
     ]
-    return all(path.exists() for path in required)
+
+    for asset in candidate_tokenizer_assets:
+        try:
+            if asset.exists() and asset.stat().st_size > 0:
+                return True
+        except Exception:
+            continue
+
+    return False
 
 
 def ensure_onnx_tokenizer(force_download: bool = False) -> Dict[str, object]:

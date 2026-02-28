@@ -397,9 +397,16 @@ def get_onnx_status() -> dict:
     """Get status of ONNX translator."""
     models_dir = get_onnx_models_dir()
     tokenizer_ready = False
+    tokenizer_prepare_error = None
     try:
-        from app.services.onnx_model_download_service import is_onnx_tokenizer_ready
+        from app.services.onnx_model_download_service import is_onnx_tokenizer_ready, ensure_onnx_tokenizer
         tokenizer_ready = is_onnx_tokenizer_ready()
+        if not tokenizer_ready:
+            try:
+                ensure_onnx_tokenizer(force_download=False)
+                tokenizer_ready = is_onnx_tokenizer_ready()
+            except Exception as prep_error:
+                tokenizer_prepare_error = str(prep_error)
     except Exception:
         tokenizer_ready = ONNX_TOKENIZER_DIR.exists()
 
@@ -420,6 +427,8 @@ def get_onnx_status() -> dict:
 
     if not tokenizer_ready:
         issues.append("tokenizer:missing_or_incomplete")
+        if tokenizer_prepare_error:
+            issues.append("tokenizer:auto_prepare_failed")
 
     return {
         "available": ensure_onnx_models() and tokenizer_ready,

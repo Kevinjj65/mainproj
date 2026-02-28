@@ -21,6 +21,7 @@ onnxruntime
 
 # --- Tokenization / utils ---
 tokenizers
+sentencepiece
 regex
 safetensors
 

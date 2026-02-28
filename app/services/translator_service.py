@@ -1,7 +1,8 @@
 import sys
 import torch
+import re
 from pathlib import Path
-from langdetect import detect, DetectorFactory, LangDetectException
+from langdetect import detect, detect_langs, DetectorFactory, LangDetectException
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from transformers import BitsAndBytesConfig
 from app.config import (
@@ -34,8 +35,24 @@ def detect_supported_language(text: str):
     if not text or not text.strip():
         return None
 
+    normalized = text.strip()
+
+    # Heuristic: plain ASCII text is usually English in this app context.
+    # Prevents false negatives for short phrases like "hi how are you".
+    ascii_chars = sum(1 for ch in normalized if ord(ch) < 128)
+    ascii_ratio = ascii_chars / max(1, len(normalized))
+    if ascii_ratio > 0.95 and re.search(r"[A-Za-z]", normalized):
+        return "en"
+
     try:
-        detected = detect(text)
+        # Prefer ranked candidates and choose first supported alias.
+        for candidate in detect_langs(normalized):
+            short = candidate.lang.split("-")[0].lower()
+            resolved = LANG_ALIASES.get(short)
+            if resolved:
+                return resolved
+
+        detected = detect(normalized)
     except LangDetectException:
         return None
 

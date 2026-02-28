@@ -5,15 +5,19 @@ import re
 import time
 import os
 import tempfile
+from pathlib import Path
 from werkzeug.utils import secure_filename
 import psutil
+import app.config as app_config
 from app.config import LANG_MAP, LANG_ALIASES, NLLB_LANG_MAP, USE_ONNX_TRANSLATOR, ONNX_LANG_MAP
 from app.services.cache_service import model_cache
 from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, get_current_name, SERVER_URL
 from app.services.translator_service import translate, detect_supported_language, unload_translator, preload_translator
-from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear, add_pdf_to_rag
+from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear, add_pdf_to_rag, get_embed_model
 from app.services.benchmark_service import benchmark_pipeline, benchmark_resource_usage, benchmark_llm_metrics, benchmark_translator_metrics, benchmark_rag_metrics
 from app.services.onnx_translator_service import translate_onnx, get_onnx_status, unload_onnx_translator, preload_onnx_translator
+from app.services.onnx_model_download_service import get_onnx_catalog, download_onnx_models
+from app.services.query_cache_service import QueryCache
 
 
 def _clean_generation(text: str) -> str:
@@ -25,6 +29,40 @@ def _clean_generation(text: str) -> str:
     return cleaned.strip()
 
 bp = Blueprint("api", __name__)
+ACTIVE_TRANSLATOR = "onnx" if USE_ONNX_TRANSLATOR else "nllb"
+
+QUERY_CACHE_FILE = Path(getattr(app_config, "QUERY_CACHE_FILE", Path("models") / "query_cache.json"))
+QUERY_CACHE_SIMILARITY_THRESHOLD = float(getattr(app_config, "QUERY_CACHE_SIMILARITY_THRESHOLD", 0.80))
+QUERY_CACHE_MAX_ENTRIES = int(getattr(app_config, "QUERY_CACHE_MAX_ENTRIES", 1000))
+QUERY_CACHE_ENABLED = bool(getattr(app_config, "QUERY_CACHE_ENABLED", True))
+
+# Initialize query cache (lazy-loaded on first access)
+query_cache = None
+
+
+def get_query_cache():
+    """Lazy-load query cache on first access."""
+    global query_cache
+    if query_cache is None and QUERY_CACHE_ENABLED:
+        query_cache = QueryCache(
+            cache_file=QUERY_CACHE_FILE,
+            similarity_threshold=QUERY_CACHE_SIMILARITY_THRESHOLD,
+            max_entries=QUERY_CACHE_MAX_ENTRIES,
+        )
+    return query_cache
+
+
+def _get_effective_active_translator() -> str:
+    """Return runtime active translator, falling back to NLLB if ONNX isn't available."""
+    global ACTIVE_TRANSLATOR
+    if ACTIVE_TRANSLATOR == "onnx":
+        try:
+            if get_onnx_status().get("available"):
+                return "onnx"
+        except Exception:
+            pass
+        return "nllb"
+    return "nllb"
 
 @bp.post("/download_llm")
 def ep_download_llm():
@@ -72,8 +110,9 @@ def ep_current_llm():
 def ep_translator_status():
     """Get status of available translators (NLLB and ONNX)."""
     onnx_status = get_onnx_status()
+    active = _get_effective_active_translator()
     return jsonify({
-        "active_translator": "onnx" if USE_ONNX_TRANSLATOR and onnx_status["available"] else "nllb",
+        "active_translator": active,
         "onnx": onnx_status,
         "nllb": {
             "available": True,
@@ -81,11 +120,53 @@ def ep_translator_status():
         }
     })
 
+
+@bp.get("/onnx_models/catalog")
+def ep_onnx_models_catalog():
+    """List ONNX model files available in the configured Google Drive folder."""
+    refresh = str(request.args.get("refresh", "false")).lower() in ("1", "true", "yes")
+    try:
+        catalog = get_onnx_catalog(force_refresh=refresh)
+        return jsonify({"ok": True, **catalog})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.get("/api/onnx_models/catalog")
+def ep_onnx_models_catalog_api_alias():
+    """Alias for clients expecting /api-prefixed ONNX catalog route."""
+    return ep_onnx_models_catalog()
+
+
+@bp.post("/onnx_models/download")
+def ep_onnx_models_download():
+    """Download default or selected ONNX model files from Drive into local models directory."""
+    body = request.get_json() or {}
+    files = body.get("files")
+    include_tokenizer = body.get("include_tokenizer", True)
+    if files is not None and not isinstance(files, list):
+        return jsonify({"error": "files must be an array of file names"}), 400
+    if not isinstance(include_tokenizer, bool):
+        return jsonify({"error": "include_tokenizer must be a boolean"}), 400
+
+    try:
+        details = download_onnx_models(selected_files=files, include_tokenizer=include_tokenizer)
+        return jsonify({"ok": True, **details})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.post("/api/onnx_models/download")
+def ep_onnx_models_download_api_alias():
+    """Alias for clients expecting /api-prefixed ONNX download route."""
+    return ep_onnx_models_download()
+
 @bp.post("/toggle_translator")
 def ep_toggle_translator():
     """Toggle between ONNX and NLLB translator."""
+    global ACTIVE_TRANSLATOR
     body = request.get_json() or {}
-    use_onnx = body.get("use_onnx", USE_ONNX_TRANSLATOR)
+    use_onnx = body.get("use_onnx", _get_effective_active_translator() == "onnx")
     
     onnx_status = get_onnx_status()
     if use_onnx and not onnx_status["available"]:
@@ -97,9 +178,11 @@ def ep_toggle_translator():
     if use_onnx:
         print("[API] Switching to ONNX translator")
         unload_translator()  # Clean up NLLB if loaded
+        ACTIVE_TRANSLATOR = "onnx"
     else:
         print("[API] Switching to NLLB translator")
         unload_onnx_translator()  # Clean up ONNX if loaded
+        ACTIVE_TRANSLATOR = "nllb"
     
     return jsonify({
         "ok": True,
@@ -110,19 +193,22 @@ def ep_toggle_translator():
 @bp.post("/translator_preload")
 def ep_translator_preload():
     """Preload translator models without running a translation."""
+    global ACTIVE_TRANSLATOR
     body = request.get_json() or {}
-    use_onnx = body.get("use_onnx", USE_ONNX_TRANSLATOR)
+    use_onnx = body.get("use_onnx", _get_effective_active_translator() == "onnx")
 
     if use_onnx:
-        onnx_status = get_onnx_status()
-        if not onnx_status["available"]:
+        try:
+            details = preload_onnx_translator()
+            ACTIVE_TRANSLATOR = "onnx"
+        except Exception as e:
             return jsonify({
-                "error": "ONNX models not available",
-                "details": onnx_status
+                "error": str(e),
+                "details": get_onnx_status(),
             }), 503
-        details = preload_onnx_translator()
     else:
         details = preload_translator()
+        ACTIVE_TRANSLATOR = "nllb"
 
     return jsonify({
         "ok": True,
@@ -369,9 +455,21 @@ def ep_infer():
     if not lang or lang not in LANG_MAP:
         return jsonify({"error": f"unsupported lang: {lang}"}), 400
 
-    src_lang, en_lang = LANG_MAP[lang]
+    src_lang_key = lang
+    src_lang, en_lang = LANG_MAP[src_lang_key]
     is_source_english = (src_lang == "eng_Latn")
     print(f"Translating from {src_lang} to {en_lang} and back.")
+
+    active_translator = _get_effective_active_translator()
+    translation_backend = active_translator
+    if active_translator == "onnx" and src_lang_key not in ONNX_LANG_MAP:
+        translation_backend = "nllb"
+        print(f"[INFER] ONNX does not support source language '{src_lang_key}'. Falling back to NLLB.")
+
+    def _translate_pipeline(text_value: str, src_code: str, tgt_code: str) -> str:
+        if translation_backend == "onnx":
+            return translate_onnx(text_value, src_code, tgt_code)
+        return translate(text_value, src_code, tgt_code)
     
     try:
         # 1. Convert user input → English (using short codes)
@@ -379,7 +477,10 @@ def ep_infer():
         if is_source_english:
             english_text = text
         else:
-            english_text = translate(text, src_lang, "en")
+            if translation_backend == "onnx":
+                english_text = _translate_pipeline(text, src_lang_key, "en")
+            else:
+                english_text = _translate_pipeline(text, src_lang, "en")
         _t1 = time.perf_counter()
         translate_in_s = _t1 - _t0
         print(f"Translated input to English: {english_text}")
@@ -395,9 +496,37 @@ def ep_infer():
     # If client requests streaming (default True), stream sentence-by-sentence
     stream = bool(body.get("stream", True))
 
+    # Query caching: check if similar query exists and reuse RAG docs
+    cache_hit = False
+    cache_similarity = None
+    qcache = get_query_cache()
+
+    if qcache is not None:
+        try:
+            embed_model = get_embed_model()
+            query_embedding = embed_model.encode([english_text])[0].tolist()
+
+            cached_result = qcache.find_similar_query(query_embedding)
+            if cached_result is not None:
+                rag_docs, cache_similarity = cached_result
+                cache_hit = True
+                print(f"[Query Cache] Hit! Similarity={cache_similarity:.3f}")
+        except Exception as e:
+            print(f"[Query Cache] Warning: Cache lookup failed: {e}")
+
     # 2. RAG retrieve
     _r0 = time.perf_counter()
-    rag_docs = rag_retrieve(english_text, top_k=3)
+    if not cache_hit:
+        rag_docs = rag_retrieve(english_text, top_k=3)
+
+        # Add to cache for future queries
+        if qcache is not None:
+            try:
+                embed_model = get_embed_model()
+                query_embedding = embed_model.encode([english_text])[0].tolist()
+                qcache.add_query(english_text, query_embedding, rag_docs)
+            except Exception as e:
+                print(f"[Query Cache] Warning: Failed to cache query: {e}")
     _r1 = time.perf_counter()
     rag_retrieval_s = _r1 - _r0
     context = ""
@@ -438,16 +567,25 @@ def ep_infer():
                 }), 503
             raise
         
-        answer_native = llm_output_en if is_source_english else translate(llm_output_en, "en", src_lang)
+        if is_source_english:
+            answer_native = llm_output_en
+        else:
+            if translation_backend == "onnx":
+                answer_native = _translate_pipeline(llm_output_en, "en", src_lang_key)
+            else:
+                answer_native = _translate_pipeline(llm_output_en, "en", src_lang)
         return jsonify({
             "input": text,
             "english_in": english_text,
             "rag_used": rag_docs,
+            "cache_hit": cache_hit,
+            "cache_similarity": cache_similarity,
             "llm_prompt": final_prompt,
             "llm_output_en": llm_output_en,
             "final_output": answer_native,
             "lang_used": lang,
             "detected_lang": detected_lang,
+            "translator_backend": translation_backend,
         })
 
     # Streaming response (SSE). We will yield JSON payloads per translated sentence.
@@ -459,7 +597,18 @@ def ep_infer():
         english_output_raw = ""
         english_output_clean = ""
         # Meta event with initial English input
-        meta = {"type": "meta", "english_in": english_text, "prompt": final_prompt, "lang_used": lang, "detected_lang": detected_lang, "rag_used": rag_docs, "rag_context": context}
+        meta = {
+            "type": "meta",
+            "english_in": english_text,
+            "prompt": final_prompt,
+            "lang_used": lang,
+            "detected_lang": detected_lang,
+            "translator_backend": translation_backend,
+            "rag_used": rag_docs,
+            "rag_context": context,
+            "cache_hit": cache_hit,
+            "cache_similarity": cache_similarity,
+        }
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
         buffer = ""
@@ -481,7 +630,13 @@ def ep_infer():
                     if not sent_clean:
                         continue
                     _to0 = time.perf_counter()
-                    translated = sent_clean if is_source_english else translate(sent_clean, "en", src_lang)
+                    if is_source_english:
+                        translated = sent_clean
+                    else:
+                        if translation_backend == "onnx":
+                            translated = _translate_pipeline(sent_clean, "en", src_lang_key)
+                        else:
+                            translated = _translate_pipeline(sent_clean, "en", src_lang)
                     _to1 = time.perf_counter()
                     translate_out_total_s += (_to1 - _to0)
                     english_output_clean += (sent_clean + " ")
@@ -494,7 +649,13 @@ def ep_infer():
                 sent_clean = _clean_generation(sent)
                 if sent_clean:
                     _to0 = time.perf_counter()
-                    translated = sent_clean if is_source_english else translate(sent_clean, "en", src_lang)
+                    if is_source_english:
+                        translated = sent_clean
+                    else:
+                        if translation_backend == "onnx":
+                            translated = _translate_pipeline(sent_clean, "en", src_lang_key)
+                        else:
+                            translated = _translate_pipeline(sent_clean, "en", src_lang)
                     _to1 = time.perf_counter()
                     translate_out_total_s += (_to1 - _to0)
                     english_output_clean += (sent_clean + " ")
@@ -514,6 +675,8 @@ def ep_infer():
                     "total_pipeline_s": round(total_pipeline_s, 6),
                 },
                 "rag_used": rag_docs,
+                "cache_hit": cache_hit,
+                "cache_similarity": cache_similarity,
                 "llm_output_en_raw": english_output_raw.strip(),
                 "llm_output_en_clean": english_output_clean.strip(),
             }
@@ -756,21 +919,22 @@ def ep_rag_backend_load():
 
 @bp.get("/query_cache/stats")
 def ep_query_cache_stats():
-    """Compatibility endpoint; query cache implementation is not present in this branch."""
-    return jsonify({
-        "ok": True,
-        "enabled": False,
-        "message": "Query cache is not available in current routes implementation"
-    })
+    """Get query cache statistics."""
+    qcache = get_query_cache()
+    if qcache is None:
+        return jsonify({"ok": True, "enabled": False, "message": "Query cache is disabled"}), 200
+
+    return jsonify({"ok": True, "enabled": True, **qcache.stats()})
 
 @bp.post("/query_cache/clear")
 def ep_query_cache_clear():
-    """Compatibility endpoint; query cache implementation is not present in this branch."""
-    return jsonify({
-        "ok": True,
-        "enabled": False,
-        "message": "Query cache is not available in current routes implementation"
-    })
+    """Clear all cached queries."""
+    qcache = get_query_cache()
+    if qcache is None:
+        return jsonify({"ok": True, "message": "Query cache is disabled"}), 200
+
+    qcache.clear()
+    return jsonify({"ok": True, "message": "Query cache cleared"})
 
 @bp.post("/unload_llm")
 def ep_unload_llm():

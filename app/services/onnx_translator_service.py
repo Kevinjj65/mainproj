@@ -25,7 +25,7 @@ onnx_translator_cache = {}
 
 # Try to import tokenizer - we'll use transformers' tokenizer for now
 try:
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, M2M100Tokenizer
     TOKENIZER_AVAILABLE = True
 except ImportError:
     TOKENIZER_AVAILABLE = False
@@ -47,7 +47,80 @@ def ensure_onnx_models() -> bool:
         models_dir / "decoder" / ONNX_DECODER_MODEL,
         models_dir / "lm_head" / ONNX_LM_HEAD_MODEL,
     ]
-    return all(f.exists() for f in required)
+
+    for file_path in required:
+        if not file_path.exists() or file_path.stat().st_size < 1024:
+            return False
+        try:
+            with file_path.open("rb") as handle:
+                prefix = handle.read(256).lower()
+                if b"<!doctype html" in prefix or b"<html" in prefix:
+                    return False
+        except Exception:
+            return False
+
+    return True
+
+
+def _inspect_onnx_asset(file_path: Path) -> dict:
+    if not file_path.exists():
+        return {
+            "exists": False,
+            "size_bytes": 0,
+            "is_html": False,
+            "valid": False,
+            "reason": "missing",
+        }
+
+    try:
+        size_bytes = int(file_path.stat().st_size)
+    except Exception:
+        return {
+            "exists": True,
+            "size_bytes": 0,
+            "is_html": False,
+            "valid": False,
+            "reason": "unreadable",
+        }
+
+    if size_bytes < 1024:
+        return {
+            "exists": True,
+            "size_bytes": size_bytes,
+            "is_html": False,
+            "valid": False,
+            "reason": "too_small",
+        }
+
+    try:
+        with file_path.open("rb") as handle:
+            prefix = handle.read(256).lower()
+        is_html = (b"<!doctype html" in prefix) or (b"<html" in prefix)
+    except Exception:
+        return {
+            "exists": True,
+            "size_bytes": size_bytes,
+            "is_html": False,
+            "valid": False,
+            "reason": "unreadable",
+        }
+
+    if is_html:
+        return {
+            "exists": True,
+            "size_bytes": size_bytes,
+            "is_html": True,
+            "valid": False,
+            "reason": "html_payload",
+        }
+
+    return {
+        "exists": True,
+        "size_bytes": size_bytes,
+        "is_html": False,
+        "valid": True,
+        "reason": "ok",
+    }
 
 
 def load_onnx_tokenizer():
@@ -62,9 +135,30 @@ def load_onnx_tokenizer():
     try:
         print("[ONNX] Loading M2M-100 tokenizer from local directory...")
         tokenizer_path = str(ONNX_TOKENIZER_DIR)
-        if not ONNX_TOKENIZER_DIR.exists():
-            raise RuntimeError(f"Tokenizer directory not found: {tokenizer_path}")
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
+        try:
+            from app.services.onnx_model_download_service import ensure_onnx_tokenizer, is_onnx_tokenizer_ready
+        except Exception as prep_import_error:
+            raise RuntimeError(f"Tokenizer helper unavailable: {prep_import_error}") from prep_import_error
+
+        if (not ONNX_TOKENIZER_DIR.exists()) or (not is_onnx_tokenizer_ready()):
+            try:
+                print("[ONNX] Tokenizer files missing/incomplete. Downloading tokenizer assets...")
+                ensure_onnx_tokenizer(force_download=False)
+            except Exception as prep_error:
+                raise RuntimeError(f"Tokenizer directory not ready at: {tokenizer_path}. Auto-download failed: {prep_error}") from prep_error
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
+        except Exception as first_load_error:
+            try:
+                tokenizer = M2M100Tokenizer.from_pretrained(tokenizer_path, local_files_only=True)
+            except Exception:
+                print("[ONNX] Local tokenizer load failed. Forcing tokenizer refresh and retry...")
+                ensure_onnx_tokenizer(force_download=True)
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
+                except Exception:
+                    tokenizer = M2M100Tokenizer.from_pretrained(tokenizer_path, local_files_only=True)
         print("[ONNX] Tokenizer loaded (offline mode).")
         return tokenizer
     except Exception as e:
@@ -302,18 +396,47 @@ def preload_onnx_translator():
 def get_onnx_status() -> dict:
     """Get status of ONNX translator."""
     models_dir = get_onnx_models_dir()
+    tokenizer_ready = False
+    try:
+        from app.services.onnx_model_download_service import is_onnx_tokenizer_ready
+        tokenizer_ready = is_onnx_tokenizer_ready()
+    except Exception:
+        tokenizer_ready = ONNX_TOKENIZER_DIR.exists()
+
+    encoder_path = models_dir / "encoder" / ONNX_ENCODER_MODEL
+    decoder_path = models_dir / "decoder" / ONNX_DECODER_MODEL
+    lm_head_path = models_dir / "lm_head" / ONNX_LM_HEAD_MODEL
+
+    asset_checks = {
+        "encoder": _inspect_onnx_asset(encoder_path),
+        "decoder": _inspect_onnx_asset(decoder_path),
+        "lm_head": _inspect_onnx_asset(lm_head_path),
+    }
+
+    issues = []
+    for key, check in asset_checks.items():
+        if not check.get("valid", False):
+            issues.append(f"{key}:{check.get('reason', 'invalid')}")
+
+    if not tokenizer_ready:
+        issues.append("tokenizer:missing_or_incomplete")
+
     return {
-        "available": ensure_onnx_models(),
+        "available": ensure_onnx_models() and tokenizer_ready,
         "models_dir": str(models_dir),
         "models": {
-            "encoder": (models_dir / "encoder" / ONNX_ENCODER_MODEL).exists(),
-            "decoder": (models_dir / "decoder" / ONNX_DECODER_MODEL).exists(),
-            "lm_head": (models_dir / "lm_head" / ONNX_LM_HEAD_MODEL).exists(),
+            "encoder": encoder_path.exists(),
+            "decoder": decoder_path.exists(),
+            "lm_head": lm_head_path.exists(),
         },
         "active_models": {
             "encoder": ONNX_ENCODER_MODEL,
             "decoder": ONNX_DECODER_MODEL,
             "lm_head": ONNX_LM_HEAD_MODEL,
         },
+        "asset_checks": asset_checks,
+        "issues": issues,
         "tokenizer_available": TOKENIZER_AVAILABLE,
+        "tokenizer_ready": tokenizer_ready,
+        "tokenizer_dir": str(ONNX_TOKENIZER_DIR),
     }

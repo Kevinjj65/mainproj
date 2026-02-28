@@ -17,6 +17,7 @@ DEFAULT_MODEL_FILES = [
     "m2m100_encoder_w8a32_SAFE.onnx",
     "m2m100_decoder_w8a32.onnx",
     "m2m100_lm_head.onnx",
+    "m2m100_lm_head.onnx.data",
 ]
 DEFAULT_TOKENIZER_MODEL = "facebook/m2m100_418M"
 
@@ -102,9 +103,61 @@ def _destination_for_model(filename: str) -> Path:
         return ONNX_MODELS_DIR / "encoder" / filename
     if name.startswith("m2m100_decoder"):
         return ONNX_MODELS_DIR / "decoder" / filename
-    if name.startswith("m2m100_lm_head"):
+    if name.startswith("m2m100_lm_head") or name.startswith("lm_head"):
         return ONNX_MODELS_DIR / "lm_head" / filename
     return ONNX_MODELS_DIR / filename
+
+
+def is_default_onnx_models_ready() -> bool:
+    for filename in DEFAULT_MODEL_FILES:
+        path = _destination_for_model(filename)
+        if (not path.exists()) or path.stat().st_size < 1024:
+            return False
+        try:
+            with path.open("rb") as handle:
+                prefix = handle.read(256).lower()
+                if b"<!doctype html" in prefix or b"<html" in prefix:
+                    return False
+        except Exception:
+            return False
+    return True
+
+
+def ensure_default_onnx_models(force_download: bool = False) -> Dict[str, object]:
+    if is_default_onnx_models_ready() and not force_download:
+        return {
+            "ready": True,
+            "downloaded": False,
+            "requested_files": DEFAULT_MODEL_FILES,
+        }
+
+    details = download_onnx_models(selected_files=DEFAULT_MODEL_FILES, include_tokenizer=False)
+    return {
+        "ready": is_default_onnx_models_ready(),
+        "downloaded": True,
+        **details,
+    }
+
+
+def list_downloaded_onnx_model_files() -> List[str]:
+    if not ONNX_MODELS_DIR.exists():
+        return []
+
+    files: List[str] = []
+    for path in ONNX_MODELS_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        if not (name.endswith(".onnx") or name.endswith(".onnx.data")):
+            continue
+        try:
+            if path.stat().st_size <= 0:
+                continue
+        except Exception:
+            continue
+        files.append(str(path.relative_to(ONNX_MODELS_DIR)).replace("\\", "/"))
+
+    return sorted(files)
 
 
 def is_onnx_tokenizer_ready() -> bool:
@@ -255,6 +308,14 @@ def download_onnx_models(selected_files: List[str] | None = None, include_tokeni
     requested = selected_files or DEFAULT_MODEL_FILES
     requested = [_normalize_name(name) for name in requested if str(name).strip()]
 
+    alias_map = {
+        "lm_head.onnx.data": "m2m100_lm_head.onnx.data",
+    }
+    requested = [
+        alias_map.get(name, name)
+        for name in requested
+    ]
+
     if not requested:
         raise RuntimeError("No model files requested")
 
@@ -270,11 +331,14 @@ def download_onnx_models(selected_files: List[str] | None = None, include_tokeni
             if sidecar in available and sidecar not in expanded_requested:
                 expanded_requested.append(sidecar)
 
+    progress: List[str] = []
     downloaded: List[Dict[str, str]] = []
     for filename in expanded_requested:
         file_id = available[filename]["id"]
         destination = _destination_for_model(filename)
+        progress.append(f"Downloading {filename}")
         _download_file_from_drive(file_id, destination)
+        progress.append(f"Downloaded {filename}")
         downloaded.append({
             "name": filename,
             "id": file_id,
@@ -288,6 +352,7 @@ def download_onnx_models(selected_files: List[str] | None = None, include_tokeni
     return {
         "folder_url": DRIVE_FOLDER_URL,
         "requested_files": expanded_requested,
+        "progress": progress,
         "downloaded": downloaded,
         "tokenizer": tokenizer_info,
     }

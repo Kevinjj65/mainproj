@@ -12,11 +12,11 @@ import app.config as app_config
 from app.config import LANG_MAP, LANG_ALIASES, NLLB_LANG_MAP, USE_ONNX_TRANSLATOR, ONNX_LANG_MAP
 from app.services.cache_service import model_cache
 from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_generate, llm_generate_stream, unload_llm, get_current_name, SERVER_URL
-from app.services.translator_service import translate, detect_supported_language, unload_translator, preload_translator
+from app.services.translator_service import translate, detect_supported_language, unload_translator, preload_translator, local_translator_path
 from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear, add_pdf_to_rag, get_embed_model
 from app.services.benchmark_service import benchmark_pipeline, benchmark_resource_usage, benchmark_llm_metrics, benchmark_translator_metrics, benchmark_rag_metrics
-from app.services.onnx_translator_service import translate_onnx, get_onnx_status, unload_onnx_translator, preload_onnx_translator
-from app.services.onnx_model_download_service import get_onnx_catalog, download_onnx_models, ensure_onnx_tokenizer
+from app.services.onnx_translator_service import translate_onnx, get_onnx_status, unload_onnx_translator, preload_onnx_translator, ensure_onnx_models
+from app.services.onnx_model_download_service import get_onnx_catalog, download_onnx_models, ensure_onnx_tokenizer, list_downloaded_onnx_model_files, ensure_default_onnx_models
 from app.services.query_cache_service import QueryCache
 
 
@@ -111,13 +111,29 @@ def ep_translator_status():
     """Get status of available translators (NLLB and ONNX)."""
     onnx_status = get_onnx_status()
     active = _get_effective_active_translator()
+
+    nllb_path = local_translator_path(app_config.NLLB_MODEL)
+    nllb_downloaded = nllb_path.exists() and any(nllb_path.iterdir())
+    onnx_downloaded_models = list_downloaded_onnx_model_files()
+    nllb_downloaded_models = [app_config.NLLB_MODEL] if nllb_downloaded else []
+
     return jsonify({
         "active_translator": active,
         "onnx": onnx_status,
         "nllb": {
             "available": True,
-            "model": "facebook/nllb-200-distilled-600M"
-        }
+            "model": app_config.NLLB_MODEL,
+            "downloaded": nllb_downloaded,
+            "local_path": str(nllb_path),
+        },
+        "downloaded_models": {
+            "onnx": onnx_downloaded_models,
+            "nllb": nllb_downloaded_models,
+            "all": [
+                *[f"onnx:{name}" for name in onnx_downloaded_models],
+                *[f"nllb:{name}" for name in nllb_downloaded_models],
+            ],
+        },
     })
 
 
@@ -283,6 +299,21 @@ def ep_translate():
     if target_key not in LANG_MAP and target_key not in target_map and "_" not in target_key:
         return jsonify({"error": f"unsupported target language: {target}"}), 400
 
+    onnx_auto_download = None
+    if use_onnx and not ensure_onnx_models():
+        try:
+            onnx_auto_download = ensure_default_onnx_models(force_download=False)
+        except Exception as e:
+            return jsonify({
+                "error": "onnx model auto-download failed",
+                "details": str(e),
+            }), 503
+        if not ensure_onnx_models():
+            return jsonify({
+                "error": "onnx models unavailable after auto-download",
+                "details": "Missing required ONNX files after auto-download attempt",
+            }), 503
+
     # Helper to iterate sentences from paragraphs
     sentence_end_re = re.compile(r"(.+?[.!?](?:\"|'|”)?)(\s+|$)", re.S)
 
@@ -322,6 +353,7 @@ def ep_translate():
             "translated_text": combined,
             "sentences": translated_sentences,
             "backend": backend,
+            "auto_download": onnx_auto_download,
         })
 
     def event_stream():
@@ -330,6 +362,7 @@ def ep_translate():
             "detected_lang": src_lang_key,
             "target_lang": target_key,
             "backend": backend,
+            "auto_download": onnx_auto_download,
         }
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 

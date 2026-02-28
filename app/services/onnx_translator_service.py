@@ -345,7 +345,13 @@ def translate_onnx(text: str, src_lang: str, tgt_lang: str, max_tokens: int = 25
         Translated text
     """
     if not ensure_onnx_models():
-        raise RuntimeError("ONNX models not found. Ensure models are copied to models/translators/m2m100_onnx")
+        try:
+            from app.services.onnx_model_download_service import ensure_default_onnx_models
+            ensure_default_onnx_models(force_download=False)
+        except Exception as e:
+            raise RuntimeError(f"ONNX models not found and auto-download failed: {e}") from e
+        if not ensure_onnx_models():
+            raise RuntimeError("ONNX models not found after auto-download attempt")
     
     if not TOKENIZER_AVAILABLE:
         raise RuntimeError("transformers library required. Install with: pip install transformers")
@@ -369,8 +375,15 @@ def unload_onnx_translator():
 
 def preload_onnx_translator():
     """Preload ONNX tokenizer and sessions without running a translation."""
+    auto_download = None
     if not ensure_onnx_models():
-        raise RuntimeError("ONNX models not available")
+        try:
+            from app.services.onnx_model_download_service import ensure_default_onnx_models
+            auto_download = ensure_default_onnx_models(force_download=False)
+        except Exception as e:
+            raise RuntimeError(f"ONNX models not available and auto-download failed: {e}") from e
+        if not ensure_onnx_models():
+            raise RuntimeError("ONNX models not available after auto-download attempt")
 
     load_onnx_tokenizer()
 
@@ -385,6 +398,7 @@ def preload_onnx_translator():
 
     return {
         "tokenizer": True,
+        "auto_download": auto_download,
         "models": {
             "encoder": encoder_path.name,
             "decoder": decoder_path.name,
@@ -396,6 +410,8 @@ def preload_onnx_translator():
 def get_onnx_status() -> dict:
     """Get status of ONNX translator."""
     models_dir = get_onnx_models_dir()
+    model_ready = ensure_onnx_models()
+
     tokenizer_ready = False
     tokenizer_prepare_error = None
     try:
@@ -431,7 +447,7 @@ def get_onnx_status() -> dict:
             issues.append("tokenizer:auto_prepare_failed")
 
     return {
-        "available": ensure_onnx_models() and tokenizer_ready,
+        "available": model_ready and tokenizer_ready,
         "models_dir": str(models_dir),
         "models": {
             "encoder": encoder_path.exists(),
@@ -445,6 +461,18 @@ def get_onnx_status() -> dict:
         },
         "asset_checks": asset_checks,
         "issues": issues,
+        "model_auto_prepare": {
+            "attempted": False,
+            "ok": model_ready,
+            "error": None,
+            "requested_files": [
+                ONNX_ENCODER_MODEL,
+                ONNX_DECODER_MODEL,
+                ONNX_LM_HEAD_MODEL,
+                f"{ONNX_LM_HEAD_MODEL}.data",
+            ],
+            "downloaded_files": [],
+        },
         "tokenizer_available": TOKENIZER_AVAILABLE,
         "tokenizer_ready": tokenizer_ready,
         "tokenizer_dir": str(ONNX_TOKENIZER_DIR),

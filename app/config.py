@@ -132,8 +132,8 @@ for key, conf in LANG_CONF.items():
 LANG_MAP = {key: (conf["src"], conf["tgt"]) for key, conf in LANG_CONF.items()}
 
 # RAG configuration
-RAG_EMBEDDING_MODEL = "sentence-transformers/paraphrase-mpnet-base-v2"
-RAG_EMBEDDING_DIM = 768
+RAG_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+RAG_EMBEDDING_DIM = 384
 RAG_SIMILARITY_THRESHOLD = 0.35
 RAG_TOP_K = 3
 
@@ -144,7 +144,7 @@ LLM_DEFAULT_TEMPERATURE = 0.3
 LLM_DEFAULT_TOP_P = 0.9
 LLM_DEFAULT_TOP_K = 40
 LLM_DEFAULT_REPEAT_PENALTY = 1.1
-LLM_DEFAULT_MAX_TOKENS = 128
+LLM_DEFAULT_MAX_TOKENS = 256  # Increased from 128 to allow complete sentences
 
 def ensure_dirs():
     """Create required directories if they don't exist."""

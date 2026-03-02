@@ -42,3 +42,7 @@ ulauncher==5.15.15
 urllib3==2.6.2
 websocket-client==1.9.0
 wheel==0.45.1
+
+# Added for RAG embeddings
+faiss-cpu==1.8.3
+sentence-transformers==2.2.2

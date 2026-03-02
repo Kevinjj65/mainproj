@@ -5,13 +5,18 @@ import gc
 import re
 import os
 import torch
+import numpy as np
+from sentence_transformers import SentenceTransformer
 from pathlib import Path
 from sacrebleu.metrics import BLEU, CHRF
-from app.config import CPU_ONLY, LLM_DIR, RAG_INDEX_FILE, RAG_META_FILE, USE_ONNX_TRANSLATOR
+from app.config import CPU_ONLY, LLM_DIR, RAG_INDEX_FILE, RAG_META_FILE, USE_ONNX_TRANSLATOR, ONNX_LANG_MAP, LLM_DEFAULT_MAX_TOKENS
 from app.services.translator_service import translate, unload_translator
 from app.services.onnx_translator_service import translate_onnx, unload_onnx_translator
 from app.services.llm_service import llm_generate, llm_generate_stream, load_llm, unload_llm, local_gguf_path
 from app.services.rag_service import rag_add, rag_clear, rag_list, rag_retrieve
+
+# evaluation utilities
+from app.services.query_cache_service import QueryCache
 
 def measure_time(fn, *args, **kwargs):
     """Utility to time any function call."""
@@ -19,6 +24,37 @@ def measure_time(fn, *args, **kwargs):
     result = fn(*args, **kwargs)
     end = time.perf_counter()
     return result, end - start
+
+def _ensure_complete_sentence(text: str) -> str:
+    """Ensure text ends with a sentence terminator, append period if needed."""
+    if not text:
+        return text
+    text = text.strip()
+    if not text:
+        return text
+    if text[-1] in '.!?।':
+        return text
+    if text[-1].isalnum():
+        last_space = text.rfind(' ')
+        if last_space > len(text) / 2:
+            text = text[:last_space]
+            if text and text[-1] not in '.!?।':
+                text = text.rstrip() + '.'
+            return text
+    return text + '.'
+
+
+def _clean_generation(text: str) -> str:
+    """Basic cleaning of LLM output for evaluation context."""
+    cleaned = text
+    cleaned = re.sub(r"```.*?```", " ", cleaned, flags=re.S)
+    cleaned = re.sub(r"`+", "", cleaned)
+    cleaned = re.sub(r"^\s*Answer\s*:\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"CONTEXT:.*", "", cleaned, flags=re.S|re.I)
+    cleaned = re.sub(r"Document \d+:.*", "", cleaned, flags=re.S|re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
 
 def memory_snapshot():
     """Capture current process memory usage."""
@@ -139,6 +175,221 @@ def benchmark_pipeline(test_text, src_lang, tgt_lang, max_tokens=64):
         },
         "throughput_rps": rps
     }
+
+
+def evaluate_pipeline(queries, default_lang: str = "en", top_k: int = 3, llm_name: str = "qwen2-0_5b-instruct-q4_k_m", n_ctx: int = 4096, n_gpu_layers: int = -1):
+    """Run full pipeline on provided queries, printing metrics as it goes.
+
+    ``queries`` may be either:
+    * a single string (``default_lang`` is used for translation), or
+    * a list of dicts containing ``text`` and ``lang`` (plus optional
+      ``relevant_docs``/``ground_truth``).
+
+    ``default_lang`` serves as a fallback for string inputs and for any list
+    elements missing the ``lang`` key.
+
+    The pipeline uses the Qwen-2 model by default and will prefer ONNX-based
+    translation when the ``USE_ONNX_TRANSLATOR`` flag is set and the
+    language is supported.
+
+    Args:
+        queries: see above
+        default_lang: default language of input text when not specified per-query
+        top_k: number of RAG documents to retrieve
+        llm_name: name of the LLM to load before running; defaults to qwen2 model
+        n_ctx: context length for LLM
+        n_gpu_layers: GPU layers for LLM
+    """
+    # normalize queries input, using default language where needed
+    if isinstance(queries, str):
+        queries = [{"text": queries, "lang": default_lang}]
+    elif isinstance(queries, list):
+        # coerce any non-dicts to the simple form
+        normalized = []
+        for q in queries:
+            if isinstance(q, dict):
+                # ensure there is a lang key
+                if "lang" not in q:
+                    q["lang"] = default_lang
+                normalized.append(q)
+            else:
+                normalized.append({"text": str(q), "lang": default_lang})
+        queries = normalized
+    else:
+        raise ValueError("queries must be a string or list")
+
+    # optionally load LLM
+    if llm_name:
+        load_llm(llm_name, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers)
+    sim_model = SentenceTransformer("all-MiniLM-L6-v2")
+    cache = QueryCache(cache_file=Path("models")/"query_cache_eval.json",
+                       similarity_threshold=0.80,
+                       max_entries=1000)
+    overall = {"total_queries": len(queries), "cache_hits": 0,
+               "retrieval_successes": 0, "similarity_scores": [],
+               "query_metrics": []}
+    peak_ram = 0
+    ram_samples = []
+    cpu_samples = []
+
+    for idx, q in enumerate(queries, 1):
+        text = q.get("text", "")
+        lang = q.get("lang", default_lang)
+        relevant = q.get("relevant_docs", [])
+        ground = q.get("ground_truth")
+
+        print(f"\n=== Query {idx}/{len(queries)}: {text[:50]}...")
+        t_start = time.perf_counter()
+        mem_before = memory_snapshot()
+        ram_samples.append(mem_before["rss_mb"])
+        cpu_samples.append(mem_before["cpu_percent"])
+
+        # translation to English (prefer ONNX)
+        t0 = time.perf_counter()
+        if lang != "en":
+            if USE_ONNX_TRANSLATOR and lang in ONNX_LANG_MAP:
+                try:
+                    en = translate_onnx(text, lang, "en")
+                except Exception as e:
+                    print(f"[Eval] ONNX translation failed: {e}")
+                    try:
+                        en = translate(text, lang, "en")
+                    except Exception as e2:
+                        print(f"[Eval] fallback NLLB translation failed: {e2}")
+                        en = text
+            else:
+                try:
+                    en = translate(text, lang, "en")
+                except Exception as e:
+                    print(f"[Eval] translation to English failed: {e}")
+                    en = text
+        else:
+            en = text
+        t1 = time.perf_counter()
+        trans_in = (t1 - t0) * 1000
+
+        # cache lookup / retrieval
+        t0 = time.perf_counter()
+        emb = sim_model.encode([en])[0].tolist()
+        cached = cache.find_similar_query(emb)
+        if cached:
+            overall["cache_hits"] += 1
+            rag_docs = cached[0]
+        else:
+            rag_docs = rag_retrieve(en, top_k=top_k)
+            cache.add_query(en, emb, rag_docs)
+        t1 = time.perf_counter()
+        cache_ms = (t1 - t0) * 1000
+        retrieval_ms = cache_ms if not cached else 0.0
+
+        # retrieval metrics
+        if relevant and any(d in rag_docs for d in relevant):
+            overall["retrieval_successes"] += 1
+        for d in rag_docs:
+            other_emb = sim_model.encode([d])[0]
+            sim = float(np.dot(emb, other_emb) /
+                        (np.linalg.norm(emb) * np.linalg.norm(other_emb) + 1e-8))
+            overall["similarity_scores"].append(sim)
+
+        # LLM generation
+        t0 = time.perf_counter()
+        first_token = None
+        gen = ""
+        for chunk in llm_generate_stream(en, max_new_tokens=LLM_DEFAULT_MAX_TOKENS):
+            if first_token is None:
+                first_token = time.perf_counter()
+            gen += chunk
+        t1 = time.perf_counter()
+        llm_ms = (t1 - t0) * 1000
+        first_latency = ((first_token - t0) * 1000) if first_token else None
+        gen = _ensure_complete_sentence(_clean_generation(gen))
+
+        # back translation (prefer ONNX)
+        t0 = time.perf_counter()
+        if lang != "en":
+            if USE_ONNX_TRANSLATOR and lang in ONNX_LANG_MAP:
+                try:
+                    final = translate_onnx(gen, "en", lang)
+                except Exception as e:
+                    print(f"[Eval] ONNX back-translation failed: {e}")
+                    try:
+                        final = translate(gen, "en", lang)
+                    except Exception as e2:
+                        print(f"[Eval] fallback back-translation failed: {e2}")
+                        final = gen
+            else:
+                try:
+                    final = translate(gen, "en", lang)
+                except Exception as e:
+                    print(f"[Eval] back-translation failed: {e}")
+                    final = gen
+        else:
+            final = gen
+        t1 = time.perf_counter()
+        back_ms = (t1 - t0) * 1000
+        final = _ensure_complete_sentence(final)
+
+        t_end = time.perf_counter()
+        total_ms = (t_end - t_start) * 1000
+
+        mem_after = memory_snapshot()
+        ram_samples.append(mem_after["rss_mb"])
+        cpu_samples.append(mem_after["cpu_percent"])
+        peak_ram = max(peak_ram, mem_before["rss_mb"], mem_after["rss_mb"])
+
+        # quality
+        bleu_score = BLEU().sentence_score(final, [text]).score
+        chrf_score = CHRF().sentence_score(final, [text]).score
+        sem_sim = None
+        if ground:
+            emb1 = sim_model.encode([final])[0]
+            emb2 = sim_model.encode([ground])[0]
+            sem_sim = float(np.dot(emb1, emb2) /
+                            (np.linalg.norm(emb1) * np.linalg.norm(emb2) + 1e-8))
+
+        entry = {
+            "text": text,
+            "lang": lang,
+            "latencies_ms": {
+                "translate_in": trans_in,
+                "cache_lookup": cache_ms,
+                "retrieval": retrieval_ms,
+                "llm": llm_ms,
+                "first_token": first_latency,
+                "back_translate": back_ms,
+                "total": total_ms,
+            },
+            "ram_before": mem_before["rss_mb"],
+            "ram_after": mem_after["rss_mb"],
+            "cpu_before": mem_before["cpu_percent"],
+            "cpu_after": mem_after["cpu_percent"],
+            "bleu": bleu_score,
+            "chrf": chrf_score,
+            "sem_sim": sem_sim,
+        }
+        overall["query_metrics"].append(entry)
+        print(json.dumps(entry, indent=2))
+
+    # summary
+    hit_rate = overall["cache_hits"] / overall["total_queries"] if overall["total_queries"]>0 else 0
+    recall = overall["retrieval_successes"] / overall["total_queries"] if overall["total_queries"]>0 else 0
+    avg_sim = float(np.mean(overall["similarity_scores"])) if overall["similarity_scores"] else 0
+    summary = {
+        "total_queries": overall["total_queries"],
+        "cache_hit_rate": hit_rate,
+        "recall_at_k": recall,
+        "avg_topk_similarity": avg_sim,
+        "peak_ram_mb": peak_ram,
+        "avg_ram_mb": float(np.mean(ram_samples)) if ram_samples else 0,
+        "avg_cpu_percent": float(np.mean(cpu_samples)) if cpu_samples else 0,
+    }
+    print("\n===== SUMMARY =====")
+    print(json.dumps(summary, indent=2))
+    overall["summary"] = summary
+    # unload LLM if we loaded it
+    if llm_name:
+        unload_llm()
+    return overall
 
 
 def benchmark_resource_usage(

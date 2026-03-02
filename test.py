@@ -272,3 +272,12 @@ en_translated_text = translate_paragraph(
 )
 print(f"{src_lang}: {hi_text}")
 print(f"{tgt_lang}: {en_translated_text}")
+
+# Example evaluation usage
+if __name__ == '"__main__"':
+    from app.services.benchmark_service import evaluate_pipeline
+
+    sample_queries = [{'text': 'What is the capital of France?', 'lang': 'en'}, {'text': 'भारत का राष्ट्रपति कौन है?', 'lang': 'hi'}]
+    print('Running pipeline evaluation on sample queries')
+    evaluate_pipeline(sample_queries, top_k=3, llm_name='tinyllama-1.1b-chat-v1.0.Q4_K_M')
+    print('evaluation complete')

@@ -15,18 +15,106 @@ from app.services.llm_service import download_gguf, load_llm_from_gguf, llm_gene
 from app.services.translator_service import translate, detect_supported_language, unload_translator, preload_translator, local_translator_path
 from app.services.rag_service import rag_add, rag_remove, rag_retrieve, rag_list, rag_clear, add_pdf_to_rag, get_embed_model
 from app.services.benchmark_service import benchmark_pipeline, benchmark_resource_usage, benchmark_llm_metrics, benchmark_translator_metrics, benchmark_rag_metrics
+from app.services.benchmark_cache_service import benchmark_query_cache
 from app.services.onnx_translator_service import translate_onnx, get_onnx_status, unload_onnx_translator, preload_onnx_translator, ensure_onnx_models
 from app.services.onnx_model_download_service import get_onnx_catalog, download_onnx_models, ensure_onnx_tokenizer, list_downloaded_onnx_model_files, ensure_default_onnx_models
 from app.services.query_cache_service import QueryCache
 
 
 def _clean_generation(text: str) -> str:
-    """Remove code fences and noisy prefixes from model output."""
+    """Sanitize model output by removing noise and context echoes."""
     cleaned = text
-    cleaned = re.sub(r"```.*?```", " ", cleaned, flags=re.S)  # drop fenced blocks
-    cleaned = re.sub(r"`+", "", cleaned)  # drop stray backticks
-    cleaned = re.sub(r"^\s*Answer\s*:\s*", "", cleaned, flags=re.I)  # drop leading Answer:
+    # drop fenced blocks and stray backticks
+    cleaned = re.sub(r"```.*?```", " ", cleaned, flags=re.S)
+    cleaned = re.sub(r"`+", "", cleaned)
+    # remove common prefixes
+    cleaned = re.sub(r"^\s*Answer\s*:\s*", "", cleaned, flags=re.I)
+    # strip out any residual context echoes
+    cleaned = re.sub(r"CONTEXT:.*", "", cleaned, flags=re.S|re.I)
+    cleaned = re.sub(r"Document \d+:.*", "", cleaned, flags=re.S|re.I)
+    # collapse whitespace and trim
+    cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
+
+
+def _clean_rag_context(docs: list) -> str:
+    """
+    Clean RAG documents: filter tables, remove incomplete lines, extract main text.
+    Returns cleaned, readable context for LLM prompt.
+    """
+    if not docs:
+        return ""
+    
+    cleaned_docs = []
+    for doc in docs:
+        text = doc.get("text") if isinstance(doc, dict) else str(doc)
+        if not text:
+            continue
+        
+        # Remove table-like formatting (lines with many |, -, ✓, ✗, etc.)
+        lines = text.split('\n')
+        filtered_lines = []
+        for line in lines:
+            # Skip table separators and headers
+            if re.match(r'^[\s\|:=\-\+]+$', line):
+                continue
+            # Skip lines that are mostly table formatting
+            if line.count('|') > 3 or line.count('—') > 2:
+                continue
+            # Skip numbered/bullet list continuations that look incomplete
+            if re.match(r'^\s*\d+\s+[A-Z]\s*$', line):
+                continue
+            # Keep meaningful content
+            line_clean = line.strip()
+            if line_clean and len(line_clean) > 10:  # Practical minimum
+                filtered_lines.append(line_clean)
+        
+        # Join cleaned lines and remove very long incomplete sequences
+        cleaned_text = " ".join(filtered_lines)
+        # Truncate to reasonable length and ensure sentence ends
+        if len(cleaned_text) > 500:
+            cleaned_text = cleaned_text[:500]
+            # Find last sentence boundary
+            for punct in '.!?।':
+                idx = cleaned_text.rfind(punct)
+                if idx > 200:  # Ensure we keep enough content
+                    cleaned_text = cleaned_text[:idx+1]
+                    break
+        
+        if cleaned_text and len(cleaned_text) > 20:
+            cleaned_docs.append(cleaned_text)
+    
+    return "\n".join(cleaned_docs)
+
+
+def _ensure_complete_sentence(text: str) -> str:
+    """
+    Ensure text ends with a sentence terminator. If cut mid-word, backtrack to last space.
+    """
+    if not text:
+        return text
+    
+    text = text.strip()
+    if not text:
+        return text
+    
+    # Already ends with punctuation
+    if text[-1] in '.!?।':
+        return text
+    
+    # Check if ends mid-word (last char is alphanumeric)
+    if text[-1].isalnum():
+        # Find last space or punctuation
+        last_space = text.rfind(' ')
+        if last_space > len(text) / 2:  # Keep at least half the text
+            text = text[:last_space]
+            # Add period if not already ending with punct
+            if text and text[-1] not in '.!?।':
+                text = text.rstrip() + '.'
+            return text
+    
+    # Append period
+    return text + '.'
 
 bp = Blueprint("api", __name__)
 ACTIVE_TRANSLATOR = "onnx" if USE_ONNX_TRANSLATOR else "nllb"
@@ -78,8 +166,10 @@ def ep_download_llm():
 
 @bp.get("/list_llms")
 def ep_list_llms():
+    from app.services.llm_service import list_all_llms
+
     return jsonify({
-        "downloaded_llms": model_cache["llms"],
+        "downloaded_llms": list_all_llms(),
         "loaded_llm": get_current_name(),
         "server_url": SERVER_URL,
     })
@@ -584,26 +674,84 @@ def ep_infer():
     _r1 = time.perf_counter()
     rag_retrieval_s = _r1 - _r0
     context = ""
+    out_of_bounds = False
     if rag_docs:
-        context = "\n".join(f"Document {i+1}: {d}" for i, d in enumerate(rag_docs))
+        # Clean RAG context to remove tables, incomplete text, etc.
+        context = _clean_rag_context(rag_docs)
+        if not context.strip():
+            # Even after cleaning, no meaningful content
+            out_of_bounds = True
+    else:
+        # no relevant documents found -> out-of-knowledge query
+        out_of_bounds = True
+
+    # 3. If query is out-of-bounds, send a fallback message in user language
+    if out_of_bounds:
+        fallback_en = "I'm sorry, I don't have information on that topic."
+        if is_source_english:
+            answer_native = fallback_en
+        else:
+            if translation_backend == "onnx":
+                answer_native = _translate_pipeline(fallback_en, "en", src_lang_key)
+            else:
+                answer_native = _translate_pipeline(fallback_en, "en", src_lang)
+
+        if not stream:
+            return jsonify({
+                "input": text,
+                "english_in": english_text,
+                "rag_used": rag_docs,
+                "cache_hit": cache_hit,
+                "cache_similarity": cache_similarity,
+                "llm_prompt": None,
+                "llm_output_en": None,
+                "final_output": answer_native,
+                "lang_used": lang,
+                "detected_lang": detected_lang,
+                "translator_backend": translation_backend,
+                "out_of_bounds": True,
+            })
+
+        # streaming: emit meta + single sentence, then end
+        def event_stream():
+            meta = {
+                "type": "meta",
+                "english_in": english_text,
+                "prompt": None,
+                "lang_used": lang,
+                "detected_lang": detected_lang,
+                "translator_backend": translation_backend,
+                "rag_used": rag_docs,
+                "rag_context": context,
+                "cache_hit": cache_hit,
+                "cache_similarity": cache_similarity,
+                "out_of_bounds": True,
+            }
+            yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+            payload = {"type": "sentence", "english": fallback_en, "translated": answer_native}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            # done event is naturally ended by caller when stream exhausts
+        return Response(stream_with_context(event_stream()), mimetype="text/event-stream")
 
     # 3. Build prompt for LLM
     context_block = f"Relevant context:\n{context}\n" if context else ""
-    final_prompt = f"""
-    You are an answer extraction engine.
+    final_prompt = f"""You are a helpful assistant that answers questions based only on provided context.
 
-    RULES:
-    - Answer using ONLY the information present in the CONTEXT.
-    - Output ONE short sentence or phrase.
+STRICT RULES:
+1. Answer ONLY using information from the CONTEXT below.
+2. NEVER invent, guess, or add information not in the context.
+3. NEVER repeat or quote the context verbatim or include context framework text.
+4. NEVER mention "CONTEXT", "Document", "Table", or "Reference".
+5. Generate a COMPLETE, GRAMMATICALLY CORRECT sentence. Never stop mid-sentence or mid-word.
+6. If context is insufficient or irrelevant, respond: "I don't have information on that topic."
+7. Output exactly ONE sentence or phrase that directly answers the question.
 
-    CONTEXT:
-    {context_block}
+CONTEXT:
+{context_block}
 
-    QUESTION:
-    {english_text}
+QUESTION: {english_text}
 
-    ANSWER:
-    """
+ANSWER:"""
     print(context_block)
 
     # 4/5. Run inference and (optionally) stream translations back
@@ -612,6 +760,8 @@ def ep_infer():
         try:
             llm_output_en = llm_generate(final_prompt, max_new_tokens=max_tokens)
             llm_output_en = _clean_generation(llm_output_en)
+            # ensure complete sentence (no mid-word cutoff)
+            llm_output_en = _ensure_complete_sentence(llm_output_en)
         except RuntimeError as e:
             if "llama_decode returned -1" in str(e):
                 return jsonify({
@@ -628,6 +778,10 @@ def ep_infer():
                 answer_native = _translate_pipeline(llm_output_en, "en", src_lang_key)
             else:
                 answer_native = _translate_pipeline(llm_output_en, "en", src_lang)
+        
+        # ensure translated answer is also complete
+        answer_native = _ensure_complete_sentence(answer_native)
+        
         return jsonify({
             "input": text,
             "english_in": english_text,
@@ -694,6 +848,8 @@ def ep_infer():
                     _to1 = time.perf_counter()
                     translate_out_total_s += (_to1 - _to0)
                     english_output_clean += (sent_clean + " ")
+                    # ensure translated answer is complete
+                    translated = _ensure_complete_sentence(translated)
                     payload = {"type": "sentence", "english": sent_clean, "translated": translated}
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -701,6 +857,8 @@ def ep_infer():
             if buffer.strip():
                 sent = buffer.strip()
                 sent_clean = _clean_generation(sent)
+                # ensure final output is complete sentence
+                sent_clean = _ensure_complete_sentence(sent_clean)
                 if sent_clean:
                     _to0 = time.perf_counter()
                     if is_source_english:
@@ -713,6 +871,8 @@ def ep_infer():
                     _to1 = time.perf_counter()
                     translate_out_total_s += (_to1 - _to0)
                     english_output_clean += (sent_clean + " ")
+                    # ensure translated answer is complete
+                    translated = _ensure_complete_sentence(translated)
                     payload = {"type": "sentence", "english": sent_clean, "translated": translated}
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -1335,5 +1495,88 @@ def ep_rag_metrics():
     except Exception as e:
         return jsonify({
             "error": "benchmark failed",
+            "details": str(e)
+        }), 500
+
+
+@bp.post("/benchmark/cache")
+def ep_benchmark_cache():
+    """
+    Benchmark query cache performance: hit ratio, latency improvement, memory usage.
+    
+    Measures:
+    - Baseline latency (RAG only, no cache)
+    - Cache miss latency (first query)
+    - Cache hit latency (repeated queries)
+    - Hit ratio, speedup, time saved
+    
+    Request body:
+    {
+        "queries": [
+            {"text": "What is machine learning?", "lang": "en"},
+            {"text": "मशीन लर्निंग क्या है?", "lang": "hi"},
+            ...
+        ],
+        "num_repeats": 3,           // optional, default 3 (times to repeat for hit measurement)
+        "similarity_threshold": 0.80 // optional, cache hit threshold
+    }
+    
+    Returns:
+    {
+        "ok": true,
+        "summary": {
+            "total_queries": 2,
+            "total_runs": 8,              // queries * (1 baseline + 1 miss + num_repeats)
+            "num_repeats": 3,
+            "avg_hit_ratio": 0.95,        // 0-1
+            "avg_latency_no_cache_ms": 245.5,
+            "avg_latency_cache_miss_ms": 260.2,
+            "avg_latency_cache_hit_ms": 15.3,
+            "speedup_hit_vs_miss": 17.0,
+            "speedup_hit_vs_no_cache": 16.0,
+            "total_time_saved_ms": 690.4,
+            "cache_efficiency_percent": 93.7
+        },
+        "per_query": [
+            {
+                "text": "What is machine learning?",
+                "lang": "en",
+                "latency_no_cache_ms": 245.5,
+                "latency_cache_miss_ms": 260.2,
+                "latency_cache_hit_ms": [15.1, 15.5, 15.2],
+                "avg_latency_cache_hit_ms": 15.3,
+                "hit_ratio": 0.95,
+                "speedup_hit_vs_miss": 17.0,
+                "speedup_hit_vs_no_cache": 16.0
+            },
+            ...
+        ],
+        "cache_state": {
+            "final_cache_entries": 2,
+            "max_entries": 1000,
+            "cache_utilization_percent": 0.2
+        }
+    }
+    """
+    body = request.get_json() or {}
+    
+    queries = body.get("queries", [])
+    num_repeats = int(body.get("num_repeats", 3))
+    similarity_threshold = float(body.get("similarity_threshold", 0.80))
+    
+    if not queries or not isinstance(queries, list):
+        return jsonify({"error": "queries must be a non-empty list of {text, lang} dicts"}), 400
+    
+    try:
+        results = benchmark_query_cache(
+            queries=queries,
+            num_repeats=num_repeats,
+            cache_similarity_threshold=similarity_threshold
+        )
+        
+        return jsonify({"ok": True, **results})
+    except Exception as e:
+        return jsonify({
+            "error": "cache benchmark failed",
             "details": str(e)
         }), 500

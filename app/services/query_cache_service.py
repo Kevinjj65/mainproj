@@ -2,7 +2,7 @@
 Query-level caching for RAG results.
 
 Caches query embeddings → RAG documents mapping to avoid re-searching when similar queries arrive.
-Uses cosine similarity on query embeddings (768-dim from paraphrase-mpnet-base-v2).
+Uses cosine similarity on query embeddings (384-dim from all-MiniLM-L6-v2).
 
 Cache structure (in-memory + disk):
   {
@@ -51,7 +51,7 @@ class QueryCache:
         Search cache for a similar query embedding.
         
         Args:
-            query_embedding: 768-dim embedding of the query
+            query_embedding: 384-dim embedding of the query
         
         Returns:
             (rag_docs, similarity_score) if found, else None
@@ -81,7 +81,7 @@ class QueryCache:
         
         Args:
             text: Original English query text
-            query_embedding: 768-dim embedding
+            query_embedding: 384-dim embedding
             rag_docs: List of RAG documents retrieved
         """
         # Enforce max size (FIFO eviction)
@@ -128,6 +128,14 @@ class QueryCache:
         try:
             data = json.loads(self.cache_file.read_text())
             self.queries = data.get("queries", [])
+            # validate dimensions; if mismatch flush cache
+            from app.config import RAG_EMBEDDING_DIM
+            for q in self.queries:
+                emb = q.get("embedding")
+                if emb and len(emb) != RAG_EMBEDDING_DIM:
+                    print(f"[QueryCache] Info: embedding dim mismatch ({len(emb)} vs {RAG_EMBEDDING_DIM}), clearing cache")
+                    self.clear()
+                    break
         except Exception as e:
             print(f"[QueryCache] Warning: Failed to load cache: {e}")
             self.queries = []

@@ -173,7 +173,7 @@ def llm_generate(
     if current_llm is None:
         raise RuntimeError("LLM not loaded")
 
-    stop = stop or ["</s>", "```"]
+    stop = stop or ["</s>", "```", "\nQuestion:", "\nUser:", "\nAssistant:"]
 
     try:
         response = current_llm(
@@ -231,7 +231,7 @@ def llm_generate_stream(
     # The llama_cpp client supports streaming; calling with stream=True
     # returns an iterator of chunks (often dicts). We yield the text
     # content from each chunk.
-    stop = stop or ["</s>", "```"]
+    stop = stop or ["</s>", "```", "\nQuestion:", "\nUser:", "\nAssistant:"]
 
     try:
         for chunk in current_llm(

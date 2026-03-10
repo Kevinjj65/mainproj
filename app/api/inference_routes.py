@@ -5,7 +5,7 @@ from flask import request, jsonify, Response, stream_with_context
 from . import bp
 from .utils import _clean_generation, _clean_rag_context, _ensure_complete_sentence
 from .translate_routes import _get_effective_active_translator, get_active_onnx_family, _onnx_lang_map_for_family
-from app.config import LANG_MAP, LANG_ALIASES
+from app.config import LANG_MAP, LANG_ALIASES, LLM_DEFAULT_MAX_TOKENS
 from app.services.llm_service import llm_generate, llm_generate_stream
 from app.services.translator_service import translate, detect_supported_language
 from app.services.onnx_translator_service import translate_onnx
@@ -13,6 +13,11 @@ from app.services.rag_service import rag_retrieve, get_embed_model
 from .system_routes import get_query_cache
 
 NO_DB_ANSWER_EN = "No answer found in the database for this question."
+MAX_FINAL_SENTENCES = 10
+
+
+def _sentence_signature(text: str) -> str:
+    return re.sub(r"\W+", " ", text.lower()).strip()
 
 
 def _is_no_db_sentence(text: str) -> bool:
@@ -47,7 +52,8 @@ def _build_grounded_prompt(question: str, rag_docs: list) -> str:
         f"\"{NO_DB_ANSWER_EN}\"\n"
         "Do not ask follow-up questions.\n"
         "Do not include unrelated content, extra tasks, or meta commentary.\n"
-        "Write 2-4 complete, grammatically correct sentences.\n"
+        "Write a detailed answer in 6-10 complete, grammatically correct sentences.\n"
+        "Avoid repeating the same sentence or idea verbatim.\n"
         "Ensure the final sentence is complete and ends with proper punctuation.\n\n"
         f"Documents:\n{context_block}\n\n"
         f"Question: {question}\n"
@@ -61,11 +67,23 @@ def _finalize_answer_en(text: str) -> str:
         return NO_DB_ANSWER_EN
 
     parts = re.split(r"(?<=[.!?।])\s+", cleaned)
-    kept = [
-        p.strip()
-        for p in parts
-        if p.strip() and not p.strip().endswith("?") and not _is_no_db_sentence(p)
-    ]
+    seen_signatures = set()
+    kept = []
+    for part in parts:
+        sentence = part.strip()
+        if not sentence or sentence.endswith("?") or _is_no_db_sentence(sentence):
+            continue
+
+        signature = _sentence_signature(sentence)
+        if len(signature) > 12 and signature in seen_signatures:
+            continue
+
+        if signature:
+            seen_signatures.add(signature)
+        kept.append(sentence)
+
+        if len(kept) >= MAX_FINAL_SENTENCES:
+            break
 
     if not kept:
         return NO_DB_ANSWER_EN
@@ -78,7 +96,8 @@ def ep_infer():
     body = request.get_json() or {}
     text = body.get("text")
     lang = body.get("lang", "auto").lower()
-    max_tokens = int(body.get("max_new_tokens", 256))
+    requested_max = int(body.get("max_new_tokens", LLM_DEFAULT_MAX_TOKENS))
+    max_tokens = max(128, min(requested_max, 900))
     stream = bool(body.get("stream", True))
 
     if not text:
@@ -158,6 +177,8 @@ def ep_infer():
         buffer = ""
         has_meaningful_output = False
         saw_no_db_output = False
+        emitted_signatures = set()
+        emitted_count = 0
         yield f"data: {json.dumps({'type': 'meta', 'english_in': english_text, 'cache_hit': cache_hit, 'cache_similarity': cache_similarity})}\n\n"
         try:
             for chunk in llm_generate_stream(final_prompt, max_new_tokens=max_tokens):
@@ -174,15 +195,43 @@ def ep_infer():
                         continue
                     if not sent_clean.strip():
                         continue
+
+                    signature = _sentence_signature(sent_clean)
+                    if len(signature) > 12 and signature in emitted_signatures:
+                        continue
+
+                    if signature:
+                        emitted_signatures.add(signature)
+
                     has_meaningful_output = True
+                    emitted_count += 1
                     translated = sent_clean if is_source_english else _translate_pipe(sent_clean, "en", lang if backend=="onnx" else src_lang)
                     yield f"data: {json.dumps({'type': 'sentence', 'translated': _ensure_complete_sentence(translated)})}\n\n"
 
+                    if emitted_count >= MAX_FINAL_SENTENCES:
+                        break
+
+                if emitted_count >= MAX_FINAL_SENTENCES:
+                    break
+
             trailing = _finalize_answer_en(buffer)
             if trailing and not _is_no_db_sentence(trailing):
-                has_meaningful_output = True
-                translated = trailing if is_source_english else _translate_pipe(trailing, "en", lang if backend=="onnx" else src_lang)
-                yield f"data: {json.dumps({'type': 'sentence', 'translated': _ensure_complete_sentence(translated)})}\n\n"
+                trailing_sentences = re.split(r"(?<=[.!?।])\s+", trailing)
+                for trailing_sentence in trailing_sentences:
+                    trailing_sentence = trailing_sentence.strip()
+                    if not trailing_sentence or trailing_sentence.endswith("?"):
+                        continue
+                    signature = _sentence_signature(trailing_sentence)
+                    if len(signature) > 12 and signature in emitted_signatures:
+                        continue
+                    has_meaningful_output = True
+                    emitted_count += 1
+                    if signature:
+                        emitted_signatures.add(signature)
+                    translated = trailing_sentence if is_source_english else _translate_pipe(trailing_sentence, "en", lang if backend=="onnx" else src_lang)
+                    yield f"data: {json.dumps({'type': 'sentence', 'translated': _ensure_complete_sentence(translated)})}\n\n"
+                    if emitted_count >= MAX_FINAL_SENTENCES:
+                        break
             elif (not has_meaningful_output) and (saw_no_db_output or _is_no_db_sentence(trailing)):
                 fallback_native = NO_DB_ANSWER_EN if is_source_english else _translate_pipe(NO_DB_ANSWER_EN, "en", lang if backend=="onnx" else src_lang)
                 yield f"data: {json.dumps({'type': 'sentence', 'translated': _ensure_complete_sentence(fallback_native)})}\n\n"

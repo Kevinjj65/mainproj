@@ -18,6 +18,8 @@ CACHE_FILE = BASE / "cache.json"
 RAG_DIR = BASE / "rag"
 RAG_INDEX_FILE = RAG_DIR / "rag.index"
 RAG_META_FILE = RAG_DIR / "metadata.json"
+RAG_EMBEDDING_LOCAL_DIR = RAG_DIR / "embedding_model"
+RAG_EMBEDDING_CACHE_DIR = RAG_DIR / "hf_cache"
 
 # NLLB Translator configuration
 NLLB_MODEL = "facebook/nllb-200-distilled-600M"
@@ -199,11 +201,11 @@ QUERY_CACHE_ENABLED = True
 # LLM configuration defaults
 LLM_DEFAULT_N_CTX = 4096
 LLM_DEFAULT_N_GPU_LAYERS = 0 if CPU_ONLY else -1  # 0 = CPU only, -1 = max GPU offload
-LLM_DEFAULT_TEMPERATURE = 0.3
-LLM_DEFAULT_TOP_P = 0.9
+LLM_DEFAULT_TEMPERATURE = 0.45
+LLM_DEFAULT_TOP_P = 0.92
 LLM_DEFAULT_TOP_K = 40
-LLM_DEFAULT_REPEAT_PENALTY = 1.1
-LLM_DEFAULT_MAX_TOKENS = 256  # Increased from 128 to allow complete sentences
+LLM_DEFAULT_REPEAT_PENALTY = 1.15
+LLM_DEFAULT_MAX_TOKENS = 384
 
 def ensure_dirs():
     """Create required directories if they don't exist."""
@@ -211,3 +213,5 @@ def ensure_dirs():
     LLM_DIR.mkdir(parents=True, exist_ok=True)
     TRANS_DIR.mkdir(parents=True, exist_ok=True)
     RAG_DIR.mkdir(exist_ok=True)
+    RAG_EMBEDDING_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    RAG_EMBEDDING_CACHE_DIR.mkdir(parents=True, exist_ok=True)

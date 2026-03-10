@@ -14,6 +14,8 @@ from app.services.rag_backend import (
 from app.config import (
     RAG_META_FILE,
     RAG_EMBEDDING_MODEL,
+    RAG_EMBEDDING_LOCAL_DIR,
+    RAG_EMBEDDING_CACHE_DIR,
     RAG_TOP_K,
     RAG_SIMILARITY_THRESHOLD,
 )
@@ -24,7 +26,15 @@ embed_model = None
 def get_embed_model():
     global embed_model
     if embed_model is None:
-        embed_model = SentenceTransformer(RAG_EMBEDDING_MODEL)
+        if RAG_EMBEDDING_LOCAL_DIR.exists() and any(RAG_EMBEDDING_LOCAL_DIR.iterdir()):
+            embed_model = SentenceTransformer(str(RAG_EMBEDDING_LOCAL_DIR))
+        else:
+            downloaded_model = SentenceTransformer(
+                RAG_EMBEDDING_MODEL,
+                cache_folder=str(RAG_EMBEDDING_CACHE_DIR),
+            )
+            downloaded_model.save(str(RAG_EMBEDDING_LOCAL_DIR))
+            embed_model = SentenceTransformer(str(RAG_EMBEDDING_LOCAL_DIR))
     return embed_model
 
 
